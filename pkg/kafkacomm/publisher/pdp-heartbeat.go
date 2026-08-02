@@ -24,7 +24,6 @@ package publisher
 
 import (
 	"fmt"
-	"github.com/google/uuid"
 	"policy-opa-pdp/consts"
 	"policy-opa-pdp/pkg/log"
 	"policy-opa-pdp/pkg/model"
@@ -33,6 +32,8 @@ import (
 	"policy-opa-pdp/pkg/policymap"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 var (
@@ -106,7 +107,7 @@ func sendPDPHeartBeat(s PdpStatusSender) error {
 		PdpGroup:    consts.PdpGroup,
 		PdpSubgroup: &pdpSubGroup,
 	}
-	pdpStatus.RequestID = uuid.New().String()
+	pdpStatus.RequestID = uuid.New().String() // pramod: duplicate assignment, again setting in "SendPdpStatus" func.
 	pdpStatus.TimestampMs = fmt.Sprintf("%d", time.Now().UnixMilli())
 
 	policiesMap := policymap.LastDeployedPolicies

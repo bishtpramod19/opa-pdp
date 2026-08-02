@@ -23,8 +23,6 @@ package api
 
 import (
 	"crypto/subtle"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"net/http"
 	"policy-opa-pdp/cfg"
 	"policy-opa-pdp/pkg/astgenerator"
@@ -35,10 +33,15 @@ import (
 	"policy-opa-pdp/pkg/metrics"
 	"policy-opa-pdp/pkg/opasdk"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // RegisterHandlers registers the HTTP handlers for the service.
 func RegisterHandlers() {
+
+	// pramod : http.Handle or http.HandleFunc, why both used? , we can use any one of them?
 
 	// Handler for OPA decision making
 	opaDecisionHandler := http.HandlerFunc(decision.OpaDecision)

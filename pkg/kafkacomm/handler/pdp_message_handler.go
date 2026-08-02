@@ -25,7 +25,6 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"policy-opa-pdp/cfg"
 	"policy-opa-pdp/consts"
 	"policy-opa-pdp/pkg/kafkacomm"
@@ -35,6 +34,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
 
 type (
@@ -108,7 +109,7 @@ func PdpMessageHandler(ctx context.Context, kc *kafkacomm.KafkaConsumer, topic s
 	log.Debug("Starting PDP Message Listener.....")
 	var stopConsuming bool
 
-	for !stopConsuming {
+	for !stopConsuming { // pramod : why not use for {}
 		select {
 		case <-ctx.Done():
 			log.Debug("Stopping PDP Listener.....")

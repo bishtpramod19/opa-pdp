@@ -1,0 +1,23 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug OPA-PDP",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/opa-pdp",
+      "env": {
+        "LOG_LEVEL": "DEBUG",
+        "KAFKA_URL": "localhost:9092",
+        "PAP_TOPIC": "policy-pdp-pap",
+        "PATCH_TOPIC": "opa-pdp-data",
+        "GROUPID": "opa-pdp-debug-1",
+        "PATCH_GROUPID": "opa-pdp-patch-debug-1",
+        "API_USER": "policyadmin",
+        "API_PASSWORD": "password",
+        "USE_KAFKA_FOR_PATCH": "false"
+      }
+    }
+  ]
+}

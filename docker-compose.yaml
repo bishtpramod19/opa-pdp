@@ -1,0 +1,60 @@
+version: "3.8"
+
+services:
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - opa-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - opa-net
+
+  # opa-pdp:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: opa-pdp
+  #   depends_on:
+  #     - kafka
+  #   ports:
+  #     - "8282:8282"
+  #   volumes:
+  #     - ./config/config.json:/app/config/config.json:ro
+  #   environment:
+  #     LOG_LEVEL: DEBUG
+  #     KAFKA_URL: kafka:29092
+  #     PAP_TOPIC: policy-pdp-pap
+  #     PATCH_TOPIC: opa-pdp-data
+  #     GROUPID: opa-pdp-local-1
+  #     PATCH_GROUPID: opa-pdp-patch-local-1
+  #     API_USER: policyadmin
+  #     API_PASSWORD: password
+  #     USE_KAFKA_FOR_PATCH: "false"
+  #   networks:
+  #     - opa-net
+
+networks:
+  opa-net:
+    driver: bridge
