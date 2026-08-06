@@ -31,29 +31,77 @@ services:
     networks:
       - opa-net
 
-  # opa-pdp:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile
-  #   container_name: opa-pdp
-  #   depends_on:
-  #     - kafka
-  #   ports:
-  #     - "8282:8282"
-  #   volumes:
-  #     - ./config/config.json:/app/config/config.json:ro
-  #   environment:
-  #     LOG_LEVEL: DEBUG
-  #     KAFKA_URL: kafka:29092
-  #     PAP_TOPIC: policy-pdp-pap
-  #     PATCH_TOPIC: opa-pdp-data
-  #     GROUPID: opa-pdp-local-1
-  #     PATCH_GROUPID: opa-pdp-patch-local-1
-  #     API_USER: policyadmin
-  #     API_PASSWORD: password
-  #     USE_KAFKA_FOR_PATCH: "false"
-  #   networks:
-  #     - opa-net
+  opa-pdp-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: opa-pdp-1
+    depends_on:
+      - kafka
+    ports:
+      - "8282:8282"
+    volumes:
+      - ./config/config.json:/app/config/config.json:ro
+    environment:
+      LOG_LEVEL: DEBUG
+      KAFKA_URL: kafka:29092
+      PAP_TOPIC: policy-pdp-pap
+      PATCH_TOPIC: opa-pdp-data
+      GROUPID: opa-pdp-1-local
+      PATCH_GROUPID: opa-pdp-1-patch-local
+      API_USER: policyadmin
+      API_PASSWORD: password
+      USE_KAFKA_FOR_PATCH: "true"
+    networks:
+      - opa-net
+
+  opa-pdp-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: opa-pdp-2
+    depends_on:
+      - kafka
+    ports:
+      - "8283:8282"
+    volumes:
+      - ./config/config.json:/app/config/config.json:ro
+    environment:
+      LOG_LEVEL: DEBUG
+      KAFKA_URL: kafka:29092
+      PAP_TOPIC: policy-pdp-pap
+      PATCH_TOPIC: opa-pdp-data
+      GROUPID: opa-pdp-2-local
+      PATCH_GROUPID: opa-pdp-2-patch-local
+      API_USER: policyadmin
+      API_PASSWORD: password
+      USE_KAFKA_FOR_PATCH: "true"
+    networks:
+      - opa-net
+
+  opa-pdp-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: opa-pdp-3
+    depends_on:
+      - kafka
+    ports:
+      - "8284:8282"
+    volumes:
+      - ./config/config.json:/app/config/config.json:ro
+    environment:
+      LOG_LEVEL: DEBUG
+      KAFKA_URL: kafka:29092
+      PAP_TOPIC: policy-pdp-pap
+      PATCH_TOPIC: opa-pdp-data
+      GROUPID: opa-pdp-3-local
+      PATCH_GROUPID: opa-pdp-3-patch-local
+      API_USER: policyadmin
+      API_PASSWORD: password
+      USE_KAFKA_FOR_PATCH: "true"
+    networks:
+      - opa-net
 
 networks:
   opa-net:

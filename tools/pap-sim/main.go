@@ -62,6 +62,13 @@ type deployRequest struct {
 	PdpSubgroup string `json:"pdpSubgroup"` // optional, defaults to "opaSubgroup"
 }
 
+type undeployRequest struct {
+	PdpName       string `json:"pdpName"`
+	PolicyName    string `json:"policyName"`    // e.g. "blacklist" - matches model.ToscaConceptIdentifier.Name
+	PolicyVersion string `json:"policyVersion"` // e.g. "1.0.0"
+	PdpSubgroup   string `json:"pdpSubgroup"`   // optional, defaults to "opaSubgroup"
+}
+
 func main() {
 	topic := os.Getenv("PAP_TOPIC")
 	if topic == "" {
@@ -93,6 +100,9 @@ func main() {
 
 	http.HandleFunc("/deploy", func(w http.ResponseWriter, r *http.Request) {
 		handleDeploy(w, r, producer, topic)
+	})
+	http.HandleFunc("/undeploy", func(w http.ResponseWriter, r *http.Request) {
+		handleUndeploy(w, r, producer, topic)
 	})
 
 	log.Printf("pap-sim listening on %s, publishing to topic %q", listenAddr, topic)
@@ -175,6 +185,60 @@ func handleDeploy(w http.ResponseWriter, r *http.Request, producer *kafkacomm.Ka
 	producer.Flush(2000)
 
 	log.Printf("published PDP_UPDATE for policy %q -> pdp %q on topic %q", req.PolicyName, req.PdpName, topic)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(payload)
+}
+
+func handleUndeploy(w http.ResponseWriter, r *http.Request, producer *kafkacomm.KafkaProducer, topic string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req undeployRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.PdpName == "" || req.PolicyName == "" || req.PolicyVersion == "" {
+		http.Error(w, "pdpName, policyName, policyVersion are all required", http.StatusBadRequest)
+		return
+	}
+	if req.PdpSubgroup == "" {
+		req.PdpSubgroup = "opaSubgroup"
+	}
+
+	pdpUpdate := model.PdpUpdate{
+		Source:                 "pap-sim",
+		PdpHeartbeatIntervalMs: 60000,
+		MessageType:            "PDP_UPDATE",
+		PoliciesToBeDeployed:   []model.ToscaPolicy{},
+		PoliciesToBeUndeployed: []model.ToscaConceptIdentifier{
+			{Name: req.PolicyName, Version: req.PolicyVersion},
+		},
+		Name:        req.PdpName,
+		TimestampMs: time.Now().UnixMilli(),
+		PdpGroup:    "opaGroup",
+		PdpSubgroup: req.PdpSubgroup,
+		RequestId:   uuid.New().String(),
+	}
+
+	payload, err := json.Marshal(pdpUpdate)
+	if err != nil {
+		http.Error(w, "failed to marshal PdpUpdate: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	kafkaMsg := &kafka.Message{Value: payload}
+	if err := producer.Produce(kafkaMsg, nil); err != nil {
+		http.Error(w, "failed to publish to Kafka: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	producer.Flush(2000)
+
+	log.Printf("published PDP_UPDATE (undeploy) for policy %q v%q -> pdp %q on topic %q", req.PolicyName, req.PolicyVersion, req.PdpName, topic)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
