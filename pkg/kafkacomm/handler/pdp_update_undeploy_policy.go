@@ -20,9 +20,11 @@
 package handler
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"policy-opa-pdp/consts"
 	"policy-opa-pdp/pkg/kafkacomm/publisher"
@@ -33,6 +35,7 @@ import (
 	"policy-opa-pdp/pkg/opasdk"
 	"policy-opa-pdp/pkg/policymap"
 	"policy-opa-pdp/pkg/utils"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -47,11 +50,11 @@ type (
 var (
 	handlePolicyUndeploymentVar HandlePolicyUndeploymentFunc = handlePolicyUndeployment
 
-	removeDirectoryFunc = utils.RemoveDirectory
+	removeOwnFileFunc = utils.RemoveFileAndEmptyParents
 
-	deleteDataSdkFunc = opasdk.DeleteData
+	removeOwnDataSdkFunc = opasdk.RemoveOwnData
 
-	deletePolicySdkFunc = opasdk.DeletePolicy
+	deletePolicySdkFunc = opasdk.DeletePolicyIfExists
 
 	opasdkGetData opasdkGetDataFunc = opasdk.GetDataInfo
 
@@ -67,8 +70,6 @@ var (
 
 	removeDataFromSdkandDirFunc = removeDataFromSdkandDir
 
-	analyseEmptyParentNodesFunc = analyseEmptyParentNodes
-
 	processDataDeletionFromSdkAndDirFunc = processDataDeletionFromSdkAndDir
 )
 
@@ -78,38 +79,35 @@ func processPoliciesTobeUndeployed(undeployedPolicies map[string]string) ([]stri
 
 	successfullyUndeployedPolicies := make(map[string]string)
 	// Unmarshal the last known policies
-	deployedPolicies, err := policymap.UnmarshalLastDeployedPolicies(policymap.LastDeployedPolicies)
+	deployedPolicies, err := policymap.UnmarshalLastDeployedPolicies(policymap.GetLastDeployedPolicies())
 	if err != nil {
+		// Without the deployed policies no undeployment can be matched, and
+		// carrying on would report both zero undeployments and zero failures.
 		log.Warnf("Failed to unmarshal LastDeployedPolicies: %v", err)
+		return []string{fmt.Sprintf("failed to read deployed policies: %v", err)}, successfullyUndeployedPolicies
 	}
 
-	for policyID, policyVersion := range undeployedPolicies {
+	// Nested policies go with their parent, and children are undeployed before their parent
+	for _, matchedPolicy := range undeployOrder(undeployedPolicies, deployedPolicies) {
+		policyID, policyVersion := policyIdentity(matchedPolicy)
 		hasFailure := false
-		// Check if undeployed policy exists in deployedPolicies
-		matchedPolicy := findDeployedPolicy(policyID, policyVersion, deployedPolicies)
-		if matchedPolicy != nil {
-			// Handle undeployment for the policy
-			errs := policyUndeploymentActionVar(matchedPolicy)
-			if len(errs) > 0 {
-				hasFailure = true
-				metrics.IncrementUndeployFailureCount()
-				metrics.IncrementTotalErrorCount()
-				failureMessages = append(failureMessages, errs...)
-			}
-			deployedPoliciesMap, err := removeUndeployedPoliciesfromMapVar(matchedPolicy)
-			if err != nil {
-				log.Warnf("Policy Name: %s, Version: %s is not removed from LastDeployedPolicies", policyID, policyVersion)
-				failureMessages = append(failureMessages, "Error in removing from LastDeployedPolicies")
-			}
-			log.Debugf("Policies Map After Undeployment : %s", deployedPoliciesMap)
-			if !hasFailure {
-				metrics.IncrementUndeploySuccessCount()
-				successfullyUndeployedPolicies[policyID] = policyVersion
-			}
-		} else {
-			// Log failure if no match is found
-			log.Debugf("Policy Name: %s, Version: %s is marked for undeployment but was not deployed", policyID, policyVersion)
-			continue
+		// Handle undeployment for the polic
+		errs := policyUndeploymentActionVar(matchedPolicy)
+		if len(errs) > 0 {
+			hasFailure = true
+			metrics.IncrementUndeployFailureCount()
+			metrics.IncrementTotalErrorCount()
+			failureMessages = append(failureMessages, errs...)
+		}
+		deployedPoliciesMap, err := removeUndeployedPoliciesfromMapVar(matchedPolicy)
+		if err != nil {
+			log.Warnf("Policy Name: %s, Version: %s is not removed from LastDeployedPolicies", policyID, policyVersion)
+			failureMessages = append(failureMessages, "Error in removing from LastDeployedPolicies")
+		}
+		log.Debugf("Policies Map After Undeployment : %s", deployedPoliciesMap)
+		if !hasFailure {
+			metrics.IncrementUndeploySuccessCount()
+			successfullyUndeployedPolicies[policyID] = policyVersion
 		}
 	}
 
@@ -188,14 +186,10 @@ func removeDataFromSdkandDir(policy map[string]interface{}) []string {
 
 func processDataDeletionFromSdkAndDir(keyPath string) []string {
 	var failureMessages []string
-	var dataPath string
-	var err error
-	// Fetch data first
-	// Call the function to check and Analyse empty parent nodes
-	if dataPath, err = analyseEmptyParentNodesFunc(keyPath); err != nil {
-		failureMessages = append(failureMessages, err.Error())
-	}
-	if err := deleteDataSdkFunc(context.Background(), dataPath); err != nil {
+	// Only the data this policy owns is deleted: the data of nested policies stays
+	// parent folder is removed only when it is empty
+	protectedFolders, neededFolders := dataFoldersAround(keyPath)
+	if err := removeOwnDataSdkFunc(context.Background(), keyPath, protectedFolders, neededFolders); err != nil {
 		log.Errorf("Error while deleting Data from SDK for path : %s , %v", keyPath, err.Error())
 		failureMessages = append(failureMessages, err.Error())
 	}
@@ -235,21 +229,23 @@ func removePolicyFromSdkandDir(policy map[string]interface{}) []string {
 	return failureMessages
 }
 
-// RemoveDataDirectory removes a directory for data
+// RemoveDataDirectory removes the data file of a data key and the folders that become empty.
+// The data files of nested policies are never touched.
 func removeDataDirectory(dataKey string) error {
 	dataPath := filepath.Join(consts.Data, dataKey)
 	log.Debugf("Removing data directory: %s", dataPath)
-	if err := removeDirectoryFunc(dataPath); err != nil {
+	if err := removeOwnFileFunc(filepath.Join(dataPath, "data.json"), consts.DataNode); err != nil {
 		return fmt.Errorf("failed to handle directory for data %s: %v", dataPath, err)
 	}
 	return nil
 }
 
-// RemovePolicyDirectory removes a directory for policies
+// RemovePolicyDirectory removes the policy file of a policy key and the folders that become empty.
+// The policy files of nested policies are never touched.
 func removePolicyDirectory(policyKey string) error {
 	policyPath := filepath.Join(consts.Policies, policyKey)
 	log.Debugf("Removing policy directory: %s", policyPath)
-	if err := removeDirectoryFunc(policyPath); err != nil {
+	if err := removeOwnFileFunc(filepath.Join(policyPath, "policy.rego"), consts.Policies); err != nil {
 		return fmt.Errorf("failed to handle directory for policy %s: %v", policyPath, err)
 	}
 	return nil
@@ -413,4 +409,91 @@ func countChildKeysFromJSON(data map[string]interface{}) map[string]int {
 		}
 	}
 	return countMap
+}
+
+// policyIdentity returns the policy-id and policy-version of a deployed policy entry.
+func policyIdentity(policy map[string]interface{}) (string, string) {
+	policyID, _ := policy[consts.PolicyId].(string)
+	policyVersion, _ := policy[consts.PolicyVersion].(string)
+	return policyID, policyVersion
+}
+
+// undeployOrder returns the deployed policies to undeploy: the requested policies that are
+// deployed, plus every policy nested under them, so that undeploying a parent also removes
+// its children. Children come before their parents and the order is always the same.
+func undeployOrder(undeployedPolicies map[string]string, deployedPolicies []map[string]interface{}) []map[string]interface{} {
+	selected := make([]map[string]interface{}, 0, len(undeployedPolicies))
+	for _, policyID := range slices.Sorted(maps.Keys(undeployedPolicies)) {
+		policyVersion := undeployedPolicies[policyID]
+		// Check if undeployed policy exists in deployedPolicies
+		matchedPolicy := findDeployedPolicy(policyID, policyVersion, deployedPolicies)
+		if matchedPolicy == nil {
+			// Log failure if no match is found
+			log.Debugf("Policy Name: %s, Version: %s is marked for undeployment but was not deployed", policyID, policyVersion)
+			continue
+		}
+		selected = appendIfNew(selected, matchedPolicy)
+		for _, nestedPolicy := range nestedDeployedPolicies(policyID, deployedPolicies) {
+			selected = appendIfNew(selected, nestedPolicy)
+		}
+	}
+	slices.SortStableFunc(selected, compareChildrenFirst)
+	return selected
+}
+
+// nestedDeployedPolicies returns the deployed policies whose names are nested under parentID.
+func nestedDeployedPolicies(parentID string, deployedPolicies []map[string]interface{}) []map[string]interface{} {
+	nested := make([]map[string]interface{}, 0)
+	for _, deployedPolicy := range deployedPolicies {
+		policyID, _ := policyIdentity(deployedPolicy)
+		if policyID != parentID && utils.IsKeyOwnedByPolicy(policyID, parentID) {
+			nested = append(nested, deployedPolicy)
+		}
+	}
+	return nested
+}
+
+func appendIfNew(policies []map[string]interface{}, policy map[string]interface{}) []map[string]interface{} {
+	policyID, policyVersion := policyIdentity(policy)
+	for _, existing := range policies {
+		existingID, existingVersion := policyIdentity(existing)
+		if existingID == policyID && existingVersion == policyVersion {
+			return policies
+		}
+	}
+	return append(policies, policy)
+}
+
+// compareChildrenFirst puts deeper policy names before shallower ones, then orders by name and version.
+func compareChildrenFirst(a, b map[string]interface{}) int {
+	idA, versionA := policyIdentity(a)
+	idB, versionB := policyIdentity(b)
+	return cmp.Or(
+		cmp.Compare(strings.Count(idB, "."), strings.Count(idA, ".")),
+		strings.Compare(idA, idB),
+		strings.Compare(versionA, versionB),
+	)
+}
+
+// dataFoldersAround tells the data-removal code which neighbouring data folders it must not damage when it removes one policy’s data.
+// It reads the deployed policies and returns two lists.
+func dataFoldersAround(keyPath string) (protectedFolders, neededFolders [][]string) {
+	deployed, err := policymap.GetDeployedPolicyDetails()
+	if err != nil {
+		log.Warnf("Could not read the deployed policies to protect nested data: %v", err)
+		return nil, nil
+	}
+	keySegments := strings.Split(strings.Trim(keyPath, "/"), "/")
+	for _, policy := range deployed {
+		for _, dataKey := range policy.DataKeys {
+			folder := utils.DataKeySegments(dataKey)
+			switch {
+			case len(folder) > len(keySegments) && utils.HasSegmentPrefix(folder, keySegments):
+				protectedFolders = append(protectedFolders, folder)
+			case len(folder) < len(keySegments) && utils.HasSegmentPrefix(keySegments, folder):
+				neededFolders = append(neededFolders, folder)
+			}
+		}
+	}
+	return protectedFolders, neededFolders
 }

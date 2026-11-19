@@ -24,14 +24,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
+	"os"
+	"path/filepath"
 	"policy-opa-pdp/consts"
 	"policy-opa-pdp/pkg/model"
 	"policy-opa-pdp/pkg/model/oapicodegen"
 	"policy-opa-pdp/pkg/policymap"
+	"policy-opa-pdp/pkg/utils"
 	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 // Success case: Extract undeployed policies
@@ -135,7 +140,7 @@ func TestProcessPoliciesTobeUndeployed_Success(t *testing.T) {
 	mockPolicyMap.On("UnmarshalLastDeployedPolicies", mock.Anything).Return(deployedPolicies, nil)
 	mockPolicyMap.On("RemoveUndeployedPoliciesfromMap", mock.Anything).Return("{}", nil)
 
-	policymap.LastDeployedPolicies = `{"test-policy": "v1"}`
+	policymap.SetLastDeployedPolicies(`{"test-policy": "v1"}`)
 
 	failures, success := processPoliciesTobeUndeployed(undeployedPolicies)
 
@@ -150,38 +155,43 @@ func TestProcessPoliciesTobeUndeployed_Failure_UnmarshalError(t *testing.T) {
 	mockPolicyMap := new(MockPolicyMap)
 	mockPolicyMap.On("UnmarshalLastDeployedPolicies", mock.Anything).Return([]map[string]interface{}{}, errors.New("unmarshal error"))
 
-	policymap.LastDeployedPolicies = `invalid json`
+	policymap.SetLastDeployedPolicies(`invalid json`)
 
 	failures, success := processPoliciesTobeUndeployed(undeployedPolicies)
 
 	assert.Empty(t, success, "Expected no successful undeployments")
-	assert.Empty(t, failures, "Expected failure messages due to unmarshal error")
+	assert.NotEmpty(t, failures, "Expected failure messages due to unmarshal error")
+	assert.Contains(t, failures[0], "failed to read deployed policies")
 }
 
 func TestRemoveDataDirectory(t *testing.T) {
 	// Backup original values
 	originalDataPath := consts.Data
-	originalFunc := removeDirectoryFunc
+	originalFunc := removeOwnFileFunc
 
 	// Restore values after test
 	defer func() {
 		consts.Data = originalDataPath
-		removeDirectoryFunc = originalFunc
+		removeOwnFileFunc = originalFunc
 	}()
 
 	// Mock the base path for testing
 	consts.Data = "/mock/data"
 
 	// Mock success case
-	removeDirectoryFunc = func(path string) error {
+	var removedFile, stoppedAt string
+	removeOwnFileFunc = func(filePath, stopDir string) error {
+		removedFile, stoppedAt = filePath, stopDir
 		return nil
 	}
 
 	err := removeDataDirectory("testkey")
 	assert.Nil(t, err)
+	assert.Equal(t, "/mock/data/testkey/data.json", removedFile, "only the policy's own data file is removed")
+	assert.Equal(t, consts.DataNode, stoppedAt)
 
 	// Mock failure case
-	removeDirectoryFunc = func(path string) error {
+	removeOwnFileFunc = func(filePath, stopDir string) error {
 		return errors.New("mocked error")
 	}
 
@@ -193,27 +203,31 @@ func TestRemoveDataDirectory(t *testing.T) {
 func TestRemovePolicyDirectory(t *testing.T) {
 	// Backup original values
 	originalPolicyPath := consts.Policies
-	originalFunc := removeDirectoryFunc
+	originalFunc := removeOwnFileFunc
 
 	// Restore values after test
 	defer func() {
 		consts.Policies = originalPolicyPath
-		removeDirectoryFunc = originalFunc
+		removeOwnFileFunc = originalFunc
 	}()
 
 	// Mock the base path for testing
 	consts.Policies = "/mock/policies"
 
 	// Mock success case
-	removeDirectoryFunc = func(path string) error {
+	var removedFile, stoppedAt string
+	removeOwnFileFunc = func(filePath, stopDir string) error {
+		removedFile, stoppedAt = filePath, stopDir
 		return nil
 	}
 
 	err := removePolicyDirectory("testpolicy")
 	assert.Nil(t, err)
+	assert.Equal(t, "/mock/policies/testpolicy/policy.rego", removedFile, "only the policy's own file is removed")
+	assert.Equal(t, "/mock/policies", stoppedAt)
 
 	// Mock failure case
-	removeDirectoryFunc = func(path string) error {
+	removeOwnFileFunc = func(filePath, stopDir string) error {
 		return errors.New("mocked error")
 	}
 
@@ -333,7 +347,7 @@ func TestProcessPoliciesTobeUndeployed_FailureInUndeployment(t *testing.T) {
 	// Define undeployed policies
 	undeployedPolicies := map[string]string{"policy2": "1.0.0"}
 
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"policy-id": "policy2","policy-version": "1.0.0"}]}`
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"policy-id": "policy2","policy-version": "1.0.0"}]}`)
 
 	// Override policyUndeploymentActionFunc to return a failure
 	policyUndeploymentActionVar = func(policy map[string]interface{}) []string {
@@ -361,7 +375,7 @@ func TestProcessPoliciesTobeUndeployed_ErrorInRemoveFromMap(t *testing.T) {
 		"policy4": "v1",
 	}
 
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"policy-id": "policy4","policy-version": "v1"}]}`
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"policy-id": "policy4","policy-version": "v1"}]}`)
 	removeUndeployedPoliciesfromMapVar = func(undeployedPolicies map[string]interface{}) (string, error) {
 		return "", errors.New("removal error")
 	}
@@ -618,7 +632,6 @@ func TestProcessDataDeletionFromSdkAndDir(t *testing.T) {
 	tests := []struct {
 		name             string
 		inputKeyPath     string
-		mockAnalyseErr   error
 		mockDeleteErr    error
 		mockRemoveErr    error
 		expectedFailures []string
@@ -626,52 +639,37 @@ func TestProcessDataDeletionFromSdkAndDir(t *testing.T) {
 		{
 			name:             "Success - No errors",
 			inputKeyPath:     "/valid/path",
-			mockAnalyseErr:   nil,
-			mockDeleteErr:    nil,
-			mockRemoveErr:    nil,
 			expectedFailures: []string{},
 		},
 		{
-			name:             "Failure - analyseEmptyParentNodes error",
-			inputKeyPath:     "/error/path",
-			mockAnalyseErr:   errors.New("failed to analyze"),
-			mockDeleteErr:    nil,
-			mockRemoveErr:    nil,
-			expectedFailures: []string{"failed to analyze"},
-		},
-		{
-			name:             "Failure - deleteDataSdkFunc error",
+			name:             "Failure - removeOwnDataSdkFunc error",
 			inputKeyPath:     "/delete/error",
-			mockAnalyseErr:   nil,
 			mockDeleteErr:    errors.New("delete failed"),
-			mockRemoveErr:    nil,
 			expectedFailures: []string{"delete failed"},
 		},
 		{
 			name:             "Failure - removeDataDirectoryFunc error",
 			inputKeyPath:     "/remove/error",
-			mockAnalyseErr:   nil,
-			mockDeleteErr:    nil,
 			mockRemoveErr:    errors.New("remove failed"),
 			expectedFailures: []string{"remove failed"},
 		},
 		{
+			// The disk cleanup still runs when the store delete fails, so both are reported.
 			name:             "Failure - Multiple errors",
 			inputKeyPath:     "/multiple/errors",
-			mockAnalyseErr:   errors.New("analyse failed"),
 			mockDeleteErr:    errors.New("delete failed"),
 			mockRemoveErr:    errors.New("remove failed"),
-			expectedFailures: []string{"analyse failed", "delete failed", "remove failed"},
+			expectedFailures: []string{"delete failed", "remove failed"},
 		},
 	}
 
+	originalRemoveData, originalRemoveDir := removeOwnDataSdkFunc, removeDataDirectoryFunc
+	defer func() { removeOwnDataSdkFunc, removeDataDirectoryFunc = originalRemoveData, originalRemoveDir }()
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Mock function variables
-			analyseEmptyParentNodesFunc = func(dataPath string) (string, error) {
-				return dataPath, tt.mockAnalyseErr
-			}
-			deleteDataSdkFunc = func(ctx context.Context, dataPath string) error {
+			removeOwnDataSdkFunc = func(ctx context.Context, dataPath string, protected, needed [][]string) error {
+				assert.NotEmpty(t, dataPath, "Data must never be deleted with an empty path")
 				return tt.mockDeleteErr
 			}
 			removeDataDirectoryFunc = func(keyPath string) error {
@@ -695,11 +693,11 @@ func TestProcessDataDeletionFromSdkAndDir(t *testing.T) {
 func TestProcessUndeploy_SecondSucceedsAfterFirstFails(t *testing.T) {
 	origAction := policyUndeploymentActionVar
 	origRemove := removeUndeployedPoliciesfromMapVar
-	origLP := policymap.LastDeployedPolicies
+	origLP := policymap.GetLastDeployedPolicies()
 	t.Cleanup(func() {
 		policyUndeploymentActionVar = origAction
 		removeUndeployedPoliciesfromMapVar = origRemove
-		policymap.LastDeployedPolicies = origLP
+		policymap.SetLastDeployedPolicies(origLP)
 	})
 
 	removeUndeployedPoliciesfromMapVar = func(map[string]interface{}) (string, error) { return "", nil }
@@ -710,7 +708,7 @@ func TestProcessUndeploy_SecondSucceedsAfterFirstFails(t *testing.T) {
 		return nil // success
 	}
 
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"policy-id": "P1","policy-version": "1.0.0"},{"policy-id": "P2","policy-version": "1.0.0"}]}`
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"policy-id": "P1","policy-version": "1.0.0"},{"policy-id": "P2","policy-version": "1.0.0"}]}`)
 
 	undeployed := map[string]string{"P1": "1.0.0", "P2": "1.0.0"}
 	_, success := processPoliciesTobeUndeployed(undeployed)
@@ -776,4 +774,246 @@ func TestRemoveDataFromSdkandDir(t *testing.T) {
 			assert.ElementsMatch(t, tt.expectedFailures, result)
 		})
 	}
+}
+
+// ---- Nested policies: undeploy only what a policy owns, and take the children with the parent ----
+
+const nestedDeployedState = `{"deployed_policies_dict":[` +
+	`{"policy-id":"onap.org.cell","policy-version":"1.0","data":["node.onap.org.cell"],"policy":["onap.org.cell"]},` +
+	`{"policy-id":"onap.org.cell.consistency","policy-version":"1.0","data":["node.onap.org.cell.consistency"],"policy":["onap.org.cell.consistency"]},` +
+	`{"policy-id":"onap.org.cell.consistency.rules","policy-version":"1.0","data":["node.onap.org.cell.consistency.rules"],"policy":["onap.org.cell.consistency.rules"]},` +
+	`{"policy-id":"onap.org.cellular","policy-version":"1.0","data":["node.onap.org.cellular"],"policy":["onap.org.cellular"]}` +
+	`]}`
+
+func useDeployedState(t *testing.T, state string) {
+	// other tests leave this hook mocked, so put the real one back for this test
+	origRemove := removeUndeployedPoliciesfromMapVar
+	t.Cleanup(func() { removeUndeployedPoliciesfromMapVar = origRemove })
+	removeUndeployedPoliciesfromMapVar = policymap.RemoveUndeployedPoliciesfromMap
+	orig := policymap.GetLastDeployedPolicies()
+	t.Cleanup(func() { policymap.SetLastDeployedPolicies(orig) })
+	policymap.SetLastDeployedPolicies(state)
+}
+
+func deployedEntries(t *testing.T) []map[string]interface{} {
+	entries, err := policymap.UnmarshalLastDeployedPolicies(nestedDeployedState)
+	require.NoError(t, err)
+	return entries
+}
+
+func orderedIDs(policies []map[string]interface{}) []string {
+	ids := make([]string, 0, len(policies))
+	for _, policy := range policies {
+		id, _ := policyIdentity(policy)
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func TestUndeployOrder(t *testing.T) {
+	deployed := deployedEntries(t)
+
+	t.Run("Parent takes its children with it, deepest first", func(t *testing.T) {
+		order := undeployOrder(map[string]string{"onap.org.cell": "1.0"}, deployed)
+		assert.Equal(t, []string{"onap.org.cell.consistency.rules", "onap.org.cell.consistency", "onap.org.cell"}, orderedIDs(order))
+	})
+	t.Run("Child takes only its own children, never its parent", func(t *testing.T) {
+		order := undeployOrder(map[string]string{"onap.org.cell.consistency": "1.0"}, deployed)
+		assert.Equal(t, []string{"onap.org.cell.consistency.rules", "onap.org.cell.consistency"}, orderedIDs(order))
+	})
+	t.Run("Leaf alone", func(t *testing.T) {
+		order := undeployOrder(map[string]string{"onap.org.cell.consistency.rules": "1.0"}, deployed)
+		assert.Equal(t, []string{"onap.org.cell.consistency.rules"}, orderedIDs(order))
+	})
+	t.Run("Parent and child requested together are undeployed once each", func(t *testing.T) {
+		order := undeployOrder(map[string]string{"onap.org.cell": "1.0", "onap.org.cell.consistency": "1.0"}, deployed)
+		assert.Equal(t, []string{"onap.org.cell.consistency.rules", "onap.org.cell.consistency", "onap.org.cell"}, orderedIDs(order))
+	})
+	t.Run("A look-alike name is not a child", func(t *testing.T) {
+		order := undeployOrder(map[string]string{"onap.org.cellular": "1.0"}, deployed)
+		assert.Equal(t, []string{"onap.org.cellular"}, orderedIDs(order))
+	})
+	t.Run("Wrong version or unknown policy is ignored", func(t *testing.T) {
+		assert.Empty(t, undeployOrder(map[string]string{"onap.org.cell": "9.9", "never.deployed": "1.0"}, deployed))
+	})
+	t.Run("The order never changes, whatever the map iteration order", func(t *testing.T) {
+		request := map[string]string{"onap.org.cellular": "1.0", "onap.org.cell": "1.0", "onap.org.cell.consistency": "1.0"}
+		expected := orderedIDs(undeployOrder(request, deployed))
+		for attempt := 0; attempt < 30; attempt++ {
+			assert.Equal(t, expected, orderedIDs(undeployOrder(request, deployed)))
+		}
+	})
+}
+
+func stubUndeployAction(t *testing.T) *[]string {
+	origAction := policyUndeploymentActionVar
+	t.Cleanup(func() { policyUndeploymentActionVar = origAction })
+	undeployed := []string{}
+	policyUndeploymentActionVar = func(policy map[string]interface{}) []string {
+		id, _ := policyIdentity(policy)
+		undeployed = append(undeployed, id)
+		return nil
+	}
+	return &undeployed
+}
+
+func TestProcessPoliciesTobeUndeployed_ParentTakesChildrenFirst(t *testing.T) {
+	useDeployedState(t, nestedDeployedState)
+	undeployed := stubUndeployAction(t)
+
+	failures, success := processPoliciesTobeUndeployed(map[string]string{"onap.org.cell": "1.0"})
+
+	assert.Empty(t, failures)
+	assert.Equal(t, []string{"onap.org.cell.consistency.rules", "onap.org.cell.consistency", "onap.org.cell"}, *undeployed)
+	assert.Equal(t, map[string]string{"onap.org.cell": "1.0", "onap.org.cell.consistency": "1.0", "onap.org.cell.consistency.rules": "1.0"}, success)
+	remaining, err := policymap.GetDeployedPolicyNames()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"onap.org.cellular"}, remaining, "only the unrelated policy is left")
+}
+
+func TestProcessPoliciesTobeUndeployed_ChildAloneLeavesParent(t *testing.T) {
+	useDeployedState(t, nestedDeployedState)
+	undeployed := stubUndeployAction(t)
+
+	failures, success := processPoliciesTobeUndeployed(map[string]string{"onap.org.cell.consistency": "1.0"})
+
+	assert.Empty(t, failures)
+	assert.Equal(t, []string{"onap.org.cell.consistency.rules", "onap.org.cell.consistency"}, *undeployed)
+	assert.NotContains(t, success, "onap.org.cell")
+	remaining, err := policymap.GetDeployedPolicyNames()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"onap.org.cell", "onap.org.cellular"}, remaining)
+}
+
+func TestProcessPoliciesTobeUndeployed_ChildFailureDoesNotStopTheParent(t *testing.T) {
+	useDeployedState(t, nestedDeployedState)
+	origAction := policyUndeploymentActionVar
+	t.Cleanup(func() { policyUndeploymentActionVar = origAction })
+	policyUndeploymentActionVar = func(policy map[string]interface{}) []string {
+		if id, _ := policyIdentity(policy); id == "onap.org.cell.consistency" {
+			return []string{"child failed"}
+		}
+		return nil
+	}
+
+	failures, success := processPoliciesTobeUndeployed(map[string]string{"onap.org.cell": "1.0"})
+
+	assert.Equal(t, []string{"child failed"}, failures)
+	assert.NotContains(t, success, "onap.org.cell.consistency", "the failed child is not reported as undeployed")
+	assert.Contains(t, success, "onap.org.cell")
+	assert.Contains(t, success, "onap.org.cell.consistency.rules")
+}
+
+// The data folders the removal of one policy has to respect.
+func TestDataFoldersAround(t *testing.T) {
+	useDeployedState(t, nestedDeployedState)
+
+	t.Run("Parent: the child's data is protected", func(t *testing.T) {
+		protected, needed := dataFoldersAround("/node/onap/org/cell")
+		assert.ElementsMatch(t, [][]string{
+			{"node", "onap", "org", "cell", "consistency"},
+			{"node", "onap", "org", "cell", "consistency", "rules"},
+		}, protected)
+		assert.Empty(t, needed)
+	})
+	t.Run("Child: the parent's folder is still needed", func(t *testing.T) {
+		protected, needed := dataFoldersAround("/node/onap/org/cell/consistency")
+		assert.Equal(t, [][]string{{"node", "onap", "org", "cell", "consistency", "rules"}}, protected)
+		assert.Equal(t, [][]string{{"node", "onap", "org", "cell"}}, needed)
+	})
+	t.Run("Look-alike sibling protects and needs nothing of the parent", func(t *testing.T) {
+		protected, needed := dataFoldersAround("/node/onap/org/cellular")
+		assert.Empty(t, protected)
+		assert.Empty(t, needed)
+	})
+	t.Run("Unreadable deployed policies", func(t *testing.T) {
+		useDeployedState(t, "{broken")
+		protected, needed := dataFoldersAround("/node/onap/org/cell")
+		assert.Nil(t, protected)
+		assert.Nil(t, needed)
+	})
+}
+
+func TestProcessDataDeletionFromSdkAndDir_PassesTheNestedFolders(t *testing.T) {
+	useDeployedState(t, nestedDeployedState)
+	origRemoveData, origRemoveDir := removeOwnDataSdkFunc, removeDataDirectoryFunc
+	t.Cleanup(func() { removeOwnDataSdkFunc, removeDataDirectoryFunc = origRemoveData, origRemoveDir })
+	var gotPath string
+	var gotProtected, gotNeeded [][]string
+	removeOwnDataSdkFunc = func(_ context.Context, dataPath string, protected, needed [][]string) error {
+		gotPath, gotProtected, gotNeeded = dataPath, protected, needed
+		return nil
+	}
+	removeDataDirectoryFunc = func(string) error { return nil }
+
+	failures := processDataDeletionFromSdkAndDir("/node/onap/org/cell/consistency")
+
+	assert.Empty(t, failures)
+	assert.Equal(t, "/node/onap/org/cell/consistency", gotPath)
+	assert.Equal(t, [][]string{{"node", "onap", "org", "cell", "consistency", "rules"}}, gotProtected)
+	assert.Equal(t, [][]string{{"node", "onap", "org", "cell"}}, gotNeeded)
+}
+
+func useTempConstPaths(t *testing.T) (policies, data string) {
+	origPolicies, origData, origDataNode, origRemove := consts.Policies, consts.Data, consts.DataNode, removeOwnFileFunc
+	t.Cleanup(func() {
+		consts.Policies, consts.Data, consts.DataNode, removeOwnFileFunc = origPolicies, origData, origDataNode, origRemove
+	})
+	root := t.TempDir()
+	consts.Policies = filepath.Join(root, "policies")
+	consts.Data = filepath.Join(root, "data")
+	consts.DataNode = filepath.Join(root, "data", "node")
+	removeOwnFileFunc = utils.RemoveFileAndEmptyParents
+	return consts.Policies, consts.Data
+}
+
+func writeUndeployFile(t *testing.T, path string) {
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0750))
+	require.NoError(t, os.WriteFile(path, []byte("x"), 0600))
+}
+
+// The disk side: removing the parent's files must never reach into the child's folders.
+func TestRemovePolicyAndDataDirectory_ParentLeavesChildFiles(t *testing.T) {
+	policies, data := useTempConstPaths(t)
+	writeUndeployFile(t, filepath.Join(policies, "onap/org/cell/policy.rego"))
+	writeUndeployFile(t, filepath.Join(policies, "onap/org/cell/consistency/policy.rego"))
+	writeUndeployFile(t, filepath.Join(data, "node/onap/org/cell/data.json"))
+	writeUndeployFile(t, filepath.Join(data, "node/onap/org/cell/consistency/data.json"))
+
+	require.NoError(t, removePolicyDirectory("/onap/org/cell"))
+	require.NoError(t, removeDataDirectory("/node/onap/org/cell"))
+
+	assert.False(t, fileExists(filepath.Join(policies, "onap/org/cell/policy.rego")))
+	assert.False(t, fileExists(filepath.Join(data, "node/onap/org/cell/data.json")))
+	assert.True(t, fileExists(filepath.Join(policies, "onap/org/cell/consistency/policy.rego")), "the child's rules stay")
+	assert.True(t, fileExists(filepath.Join(data, "node/onap/org/cell/consistency/data.json")), "the child's data stays")
+}
+
+func TestRemovePolicyAndDataDirectory_ChildLeavesParentFilesAndPrunesOnlyEmptyFolders(t *testing.T) {
+	policies, data := useTempConstPaths(t)
+	writeUndeployFile(t, filepath.Join(policies, "onap/org/cell/policy.rego"))
+	writeUndeployFile(t, filepath.Join(policies, "onap/org/cell/consistency/policy.rego"))
+	writeUndeployFile(t, filepath.Join(data, "node/onap/org/cell/data.json"))
+	writeUndeployFile(t, filepath.Join(data, "node/onap/org/cell/consistency/data.json"))
+
+	require.NoError(t, removePolicyDirectory("/onap/org/cell/consistency"))
+	require.NoError(t, removeDataDirectory("/node/onap/org/cell/consistency"))
+
+	assert.True(t, fileExists(filepath.Join(policies, "onap/org/cell/policy.rego")), "the parent's rules stay")
+	assert.True(t, fileExists(filepath.Join(data, "node/onap/org/cell/data.json")), "the parent's data stays")
+	assert.False(t, fileExists(filepath.Join(policies, "onap/org/cell/consistency")), "the emptied child folder is removed")
+	assert.False(t, fileExists(filepath.Join(data, "node/onap/org/cell/consistency")))
+}
+
+func TestRemovePolicyAndDataDirectory_BothGoneThenFoldersAreRemoved(t *testing.T) {
+	policies, data := useTempConstPaths(t)
+	writeUndeployFile(t, filepath.Join(policies, "onap/org/cell/policy.rego"))
+	writeUndeployFile(t, filepath.Join(policies, "onap/org/cell/consistency/policy.rego"))
+
+	require.NoError(t, removePolicyDirectory("/onap/org/cell/consistency"))
+	require.NoError(t, removePolicyDirectory("/onap/org/cell"))
+
+	assert.False(t, fileExists(filepath.Join(policies, "onap")), "nothing is left behind")
+	assert.True(t, fileExists(policies), "the base folder itself is kept")
+	assert.False(t, fileExists(filepath.Join(data, "node/onap")), "a missing data file is not an error")
 }

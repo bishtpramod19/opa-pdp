@@ -20,21 +20,55 @@
 package policymap
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"policy-opa-pdp/consts"
 	"policy-opa-pdp/pkg/log"
 	"policy-opa-pdp/pkg/model"
+	"policy-opa-pdp/pkg/utils"
+	"sync"
 )
+
+const dataItemsField = "data-items"
+
+type DeployedPolicy struct {
+	Name       string
+	Version    string
+	PolicyKeys []string
+	DataKeys   []string
+	DataItems  map[string][]string
+}
 
 type (
 	FormatMapOfAnyTypeFunc[T any] func(mapOfAnyType T) (string, error)
 )
 
 var (
-	LastDeployedPolicies  string
+	// lastDeployedPolicies is written by the Kafka handler goroutine while the decision
+	// and data HTTP handlers, the status publisher and the heartbeat all read it, so
+	// every access goes through mu. Read-modify-write callers hold the write lock for
+	// the whole sequence: taking it only around the store would let two concurrent
+	// updates each drop the other's policy.
+	mu                   sync.RWMutex
+	lastDeployedPolicies string
+
 	FormatMapOfAnyTypeVar FormatMapOfAnyTypeFunc[interface{}] = FormatMapofAnyType
 )
+
+// GetLastDeployedPolicies returns the JSON document describing what is currently deployed.
+func GetLastDeployedPolicies() string {
+	mu.RLock()
+	defer mu.RUnlock()
+	return lastDeployedPolicies
+}
+
+// SetLastDeployedPolicies replaces the deployed policies document.
+func SetLastDeployedPolicies(policiesMap string) {
+	mu.Lock()
+	defer mu.Unlock()
+	lastDeployedPolicies = policiesMap
+}
 
 func formatPolicyAndDataMap(deployedPolicies []map[string]interface{}) (string, error) {
 
@@ -49,11 +83,21 @@ func formatPolicyAndDataMap(deployedPolicies []map[string]interface{}) (string, 
 		return "", fmt.Errorf("failed to format json: %v", err)
 	}
 
-	// Update global state
-	LastDeployedPolicies = policyDataJSON
-	log.Infof("PoliciesDeployed Map: %v", LastDeployedPolicies)
+	return policyDataJSON, nil
+}
 
-	return LastDeployedPolicies, nil
+// storeDeployedPoliciesLocked renders deployedPolicies and publishes the result.
+// mu must already be held for writing.
+func storeDeployedPoliciesLocked(deployedPolicies []map[string]interface{}) (string, error) {
+	policyDataJSON, err := formatPolicyAndDataMap(deployedPolicies)
+	if err != nil {
+		return lastDeployedPolicies, err
+	}
+
+	lastDeployedPolicies = policyDataJSON
+	log.Infof("PoliciesDeployed Map: %v", lastDeployedPolicies)
+
+	return lastDeployedPolicies, nil
 }
 
 func FormatMapofAnyType[T any](mapOfAnyType T) (string, error) {
@@ -84,12 +128,14 @@ func UnmarshalLastDeployedPolicies(lastdeployedPolicies string) ([]map[string]in
 }
 
 func UpdateDeployedPoliciesinMap(policy model.ToscaPolicy) (string, error) {
+	mu.Lock()
+	defer mu.Unlock()
 
 	// Unmarshal the last known policies
-	deployedPolicies, err := UnmarshalLastDeployedPolicies(LastDeployedPolicies)
+	deployedPolicies, err := UnmarshalLastDeployedPolicies(lastDeployedPolicies)
 	if err != nil {
 		log.Warnf("Aborting update; LastDeployedPolicies is corrupt: %v", err)
-		return LastDeployedPolicies, err
+		return lastDeployedPolicies, err
 	}
 
 	dataKeys := make([]string, 0, len(policy.Properties.Data))
@@ -109,17 +155,22 @@ func UpdateDeployedPoliciesinMap(policy model.ToscaPolicy) (string, error) {
 		"data":               dataKeys,
 		"policy":             policyKeys,
 	}
+	if recordedItems := recordedDataItems(policy.Properties.Data); len(recordedItems) > 0 {
+		directoryMap[dataItemsField] = recordedItems
+	}
 	deployedPolicies = append(deployedPolicies, directoryMap)
-	return formatPolicyAndDataMap(deployedPolicies)
+	return storeDeployedPoliciesLocked(deployedPolicies)
 }
 
 func RemoveUndeployedPoliciesfromMap(undeployedPolicy map[string]interface{}) (string, error) {
+	mu.Lock()
+	defer mu.Unlock()
 
 	// Unmarshal the last known policies
-	deployedPolicies, err := UnmarshalLastDeployedPolicies(LastDeployedPolicies)
+	deployedPolicies, err := UnmarshalLastDeployedPolicies(lastDeployedPolicies)
 	if err != nil {
 		log.Warnf("Aborting update; LastDeployedPolicies is corrupt: %v", err)
-		return LastDeployedPolicies, err
+		return lastDeployedPolicies, err
 	}
 
 	remainingPolicies := []map[string]interface{}{}
@@ -134,7 +185,7 @@ func RemoveUndeployedPoliciesfromMap(undeployedPolicy map[string]interface{}) (s
 		}
 	}
 
-	return formatPolicyAndDataMap(remainingPolicies)
+	return storeDeployedPoliciesLocked(remainingPolicies)
 }
 
 func VerifyAndReturnPoliciesToBeDeployed(lastdeployedPoliciesMap string, pdpUpdate model.PdpUpdate) []model.ToscaPolicy {
@@ -203,9 +254,10 @@ func ExtractDeployedPolicies(policiesMap string) []model.ToscaConceptIdentifier 
 }
 
 func CheckIfPolicyAlreadyExists(policyId string) bool {
-	if len(LastDeployedPolicies) > 0 {
+	policiesMap := GetLastDeployedPolicies()
+	if len(policiesMap) > 0 {
 		// Unmarshal the last known policies
-		deployedPolicies, err := UnmarshalLastDeployedPolicies(LastDeployedPolicies)
+		deployedPolicies, err := UnmarshalLastDeployedPolicies(policiesMap)
 		if err != nil {
 			log.Warnf("Failed to unmarshal LastDeployedPolicies While Checking if Policy Already Exists: %v", err)
 		}
@@ -221,8 +273,144 @@ func CheckIfPolicyAlreadyExists(policyId string) bool {
 	return false
 }
 
+// GetDeployedPolicyNames returns the name (policy-id) of every currently deployed policy
+func GetDeployedPolicyNames() ([]string, error) {
+	deployedPolicies, err := UnmarshalLastDeployedPolicies(GetLastDeployedPolicies())
+	if err != nil {
+		return nil, err
+	}
+	return extractPolicyNames(deployedPolicies)
+}
+
+func extractPolicyNames(deployedPolicies []map[string]any) ([]string, error) {
+	names := make([]string, 0, len(deployedPolicies))
+	seen := make(map[string]struct{}, len(deployedPolicies))
+	for _, deployedPolicy := range deployedPolicies {
+		name, ok := deployedPolicy[consts.PolicyId].(string)
+		if !ok || name == "" {
+			return nil, fmt.Errorf("invalid or missing policy-id field")
+		}
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+// recordedDataItems returns, per data key, the top-level items of its JSON content.
+// Content that cannot be read is left out: the deployment reports that problem itself.
+func recordedDataItems(data map[string]string) map[string][]string {
+	items := make(map[string][]string)
+	for dataKey, encodedContent := range data {
+		decoded, err := base64.StdEncoding.DecodeString(encodedContent)
+		if err != nil {
+			continue
+		}
+		if names := utils.TopLevelItemNames(string(decoded)); len(names) > 0 {
+			items[dataKey] = names
+		}
+	}
+	return items
+}
+
+// GetDeployedPolicyDetails returns every deployed policy with the policy keys, data keys
+// and recorded data items it was deployed with.
+func GetDeployedPolicyDetails() ([]DeployedPolicy, error) {
+	entries, err := UnmarshalLastDeployedPolicies(GetLastDeployedPolicies())
+	if err != nil {
+		return nil, err
+	}
+	details := make([]DeployedPolicy, 0, len(entries))
+	for _, entry := range entries {
+		name, ok := entry[consts.PolicyId].(string)
+		if !ok || name == "" {
+			return nil, fmt.Errorf("invalid or missing policy-id field")
+		}
+		version, _ := entry[consts.PolicyVersion].(string)
+		details = append(details, DeployedPolicy{
+			Name:       name,
+			Version:    version,
+			PolicyKeys: stringList(entry["policy"]),
+			DataKeys:   stringList(entry["data"]),
+			DataItems:  stringListsByKey(entry[dataItemsField]),
+		})
+	}
+	return details, nil
+}
+
+// stringList reads a JSON array of strings; anything that is not a string is ignored.
+func stringList(value interface{}) []string {
+	list, _ := value.([]interface{})
+	result := make([]string, 0, len(list))
+	for _, element := range list {
+		if text, ok := element.(string); ok {
+			result = append(result, text)
+		}
+	}
+	return result
+}
+
+// stringListsByKey reads a JSON object whose values are arrays of strings.
+func stringListsByKey(value interface{}) map[string][]string {
+	object, _ := value.(map[string]interface{})
+	result := make(map[string][]string, len(object))
+	for key, list := range object {
+		result[key] = stringList(list)
+	}
+	return result
+}
+
+// PolicyNames returns the names of the policies
+func PolicyNames(deployed []DeployedPolicy) []string {
+	names := make([]string, 0, len(deployed))
+	seen := make(map[string]struct{}, len(deployed))
+	for _, policy := range deployed {
+		if _, duplicate := seen[policy.Name]; !duplicate {
+			seen[policy.Name] = struct{}{}
+			names = append(names, policy.Name)
+		}
+	}
+	return names
+}
+
+// WithoutPolicy returns the deployed policies other than the one called name.
+func WithoutPolicy(deployed []DeployedPolicy, name string) []DeployedPolicy {
+	others := make([]DeployedPolicy, 0, len(deployed))
+	for _, policy := range deployed {
+		if policy.Name != name {
+			others = append(others, policy)
+		}
+	}
+	return others
+}
+
+// DataKeysByPolicy returns the data keys of each policy, keyed by policy name
+func DataKeysByPolicy(deployed []DeployedPolicy) map[string][]string {
+	keys := make(map[string][]string, len(deployed))
+	for _, policy := range deployed {
+		keys[policy.Name] = append(keys[policy.Name], policy.DataKeys...)
+	}
+	return keys
+}
+
+// DataItemsByPolicy returns the recorded data items of each policy, keyed by policy name and data key
+func DataItemsByPolicy(deployed []DeployedPolicy) map[string]map[string][]string {
+	items := make(map[string]map[string][]string, len(deployed))
+	for _, policy := range deployed {
+		if items[policy.Name] == nil {
+			items[policy.Name] = make(map[string][]string)
+		}
+		for dataKey, names := range policy.DataItems {
+			items[policy.Name][dataKey] = append(items[policy.Name][dataKey], names...)
+		}
+	}
+	return items
+}
+
 func GetTotalDeployedPoliciesCountFromMap() int {
-	deployedPolicies, err := UnmarshalLastDeployedPolicies(LastDeployedPolicies)
+	deployedPolicies, err := UnmarshalLastDeployedPolicies(GetLastDeployedPolicies())
 	if err != nil {
 		log.Warnf("Failed to unmarshal LastDeployedPolicies While Getting TotalDeployedPoliciesCountFromMap: %v", err)
 		return 0

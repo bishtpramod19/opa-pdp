@@ -25,9 +25,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	openapi_types "github.com/oapi-codegen/runtime/types"
-	"github.com/open-policy-agent/opa/sdk"
-	"github.com/stretchr/testify/assert"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -38,6 +35,11 @@ import (
 	"policy-opa-pdp/pkg/policymap"
 	"testing"
 	"time"
+
+	openapi_types "github.com/oapi-codegen/runtime/types"
+	"github.com/open-policy-agent/opa/sdk"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Test for Invalid request method
@@ -347,7 +349,7 @@ var mockDecisionResultBool = &sdk.DecisionResult{
 // Test to check invalid UUID in request
 func Test_Invalid_request_UUID(t *testing.T) {
 
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"policy-id": "s3", "policy-version": "1.0"}]}`
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"policy-id": "s3", "policy-version": "1.0"}]}`)
 
 	originalFunc := OPASingletonInstance
 	// Mock the function
@@ -432,7 +434,7 @@ func Test_valid_HTTP_method(t *testing.T) {
 	}
 	defer func() { OPADecision = originalOPADecision }()
 
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"policy-id": "s3", "policy-version": "1.0"}]}`
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"policy-id": "s3", "policy-version": "1.0"}]}`)
 
 	originalFunc := OPASingletonInstance
 	// Mock the function
@@ -494,7 +496,7 @@ func Test_Error_Marshalling(t *testing.T) {
 	}
 	defer func() { OPADecision = originalOPADecision }()
 
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"policy-id": "s3", "policy-version": "1.0"}]}`
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"policy-id": "s3", "policy-version": "1.0"}]}`)
 
 	originalFunc := OPASingletonInstance
 	// Mock the function
@@ -527,7 +529,7 @@ func Test_Invalid_Decision(t *testing.T) {
 	}
 	defer func() { OPADecision = originalOPADecision }()
 
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"policy-id": "s3", "policy-version": "1.0"}]}`
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"policy-id": "s3", "policy-version": "1.0"}]}`)
 
 	originalFunc := OPASingletonInstance
 	// Mock the function
@@ -573,7 +575,7 @@ func Test_Valid_Decision_String(t *testing.T) {
 	}
 	defer func() { OPADecision = originalOPADecision }()
 
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"policy-id": "s3", "policy-version": "1.0"}]}`
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"policy-id": "s3", "policy-version": "1.0"}]}`)
 
 	originalFunc := OPASingletonInstance
 	// Mock the function
@@ -613,7 +615,7 @@ func Test_with_boolean_OPA_Decision(t *testing.T) {
 	}
 	defer func() { OPADecision = originalOPADecision }()
 
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"policy-id": "s3", "policy-version": "1.0"}]}`
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"policy-id": "s3", "policy-version": "1.0"}]}`)
 
 	originalFunc := OPASingletonInstance
 	// Mock the function
@@ -652,7 +654,7 @@ func Test_decision_Result_String(t *testing.T) {
 		return mockDecisionResult, nil
 	}
 	defer func() { OPADecision = originalOPADecision }()
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"policy-id": "s3", "policy-version": "1.0"}]}`
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"policy-id": "s3", "policy-version": "1.0"}]}`)
 
 	originalFunc := OPASingletonInstance
 	// Mock the function
@@ -673,7 +675,7 @@ func Test_decision_Result_String(t *testing.T) {
 var mockPoliciesMap string
 
 func mockLastDeployedPolicies() {
-	policymap.LastDeployedPolicies = mockPoliciesMap
+	policymap.SetLastDeployedPolicies(mockPoliciesMap)
 }
 
 // Test case: No policies deployed
@@ -760,4 +762,97 @@ func TestProcessOpaDecision_AlwaysWritesStatus(t *testing.T) {
 	processOpaDecision(rr, nil, &req, "1.0.0")
 	assert.Equal(t, http.StatusInternalServerError, rr.Code)
 	assert.NotEmpty(t, rr.Body.Bytes(), "must not return an empty body on decision error")
+}
+
+// ---- Nested policies: a parent's decision includes the output of its child ----
+
+func nestedExtractedPolicies() []model.ToscaConceptIdentifier {
+	return []model.ToscaConceptIdentifier{
+		{Name: "onap.org.cell", Version: "1.0.0"},
+		{Name: "onap.org.cell.consistency", Version: "2.0.0"},
+		{Name: "onap.org.cellular", Version: "3.0.0"},
+	}
+}
+
+// The version in the response is the version of the policy that was asked for.
+func TestGetPolicyVersion_ParentAndChildKeepTheirOwnVersion(t *testing.T) {
+	policies := nestedExtractedPolicies()
+
+	assert.Equal(t, "1.0.0", getPolicyVersion("onap/org/cell", policies))
+	assert.Equal(t, "2.0.0", getPolicyVersion("onap/org/cell/consistency", policies))
+	assert.Equal(t, "3.0.0", getPolicyVersion("onap/org/cellular", policies), "a look-alike name is its own policy")
+	assert.Equal(t, "unknown", getPolicyVersion("onap/org", policies), "a folder that is nobody's policy")
+}
+
+func TestPolicyExists_NestedNamesAreMatchedExactly(t *testing.T) {
+	policies := nestedExtractedPolicies()
+
+	assert.True(t, policyExists("onap/org/cell", policies))
+	assert.True(t, policyExists("onap/org/cell/consistency", policies))
+	assert.False(t, policyExists("onap/org/cell/consistency/rules", policies))
+	assert.False(t, policyExists("onap/org", policies))
+}
+
+func decideNested(t *testing.T, policyName string, filter string, result map[string]interface{}, version string) (*oapicodegen.OPADecisionResponse, string) {
+	origDecision := OPADecision
+	t.Cleanup(func() { OPADecision = origDecision })
+	askedPath := ""
+	OPADecision = func(_ *sdk.OPA, _ context.Context, options sdk.DecisionOptions) (*sdk.DecisionResult, error) {
+		askedPath = options.Path
+		return &sdk.DecisionResult{Result: result}, nil
+	}
+	var req oapicodegen.OPADecisionRequest
+	body := fmt.Sprintf(`{"policyName":%q,"policyFilter":[%s],"input":{"user":"alice"}}`, policyName, filter)
+	require.NoError(t, json.Unmarshal([]byte(body), &req))
+
+	rr := httptest.NewRecorder()
+	processOpaDecision(rr, nil, &req, version)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	var response oapicodegen.OPADecisionResponse
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &response))
+	return &response, askedPath
+}
+
+// OPA answers a package path with everything below it, so the child's rules come back with the parent's.
+func TestProcessOpaDecision_ParentDecisionIncludesChildOutput(t *testing.T) {
+	result := map[string]interface{}{
+		"allow":       true,
+		"consistency": map[string]interface{}{"allow": false, "reason": "limit exceeded"},
+	}
+
+	response, askedPath := decideNested(t, "onap/org/cell", `""`, result, "1.0.0")
+
+	assert.Equal(t, "onap/org/cell", askedPath, "the parent's package path is asked, which covers the child's package")
+	require.NotNil(t, response.PolicyVersion)
+	assert.Equal(t, "1.0.0", *response.PolicyVersion, "the version is the parent's, not the child's")
+	require.NotNil(t, response.Output)
+	output := *response.Output
+	assert.Equal(t, true, output["allow"])
+	child, ok := output["consistency"].(map[string]interface{})
+	require.True(t, ok, "the child's output is part of the parent's decision")
+	assert.Equal(t, false, child["allow"])
+	assert.Equal(t, "limit exceeded", child["reason"])
+}
+
+func TestProcessOpaDecision_ParentDecisionCanBeFilteredToTheChildOutput(t *testing.T) {
+	result := map[string]interface{}{
+		"allow":       true,
+		"consistency": map[string]interface{}{"allow": false},
+	}
+
+	response, _ := decideNested(t, "onap/org/cell", `"consistency/allow"`, result, "1.0.0")
+
+	require.NotNil(t, response.Output)
+	assert.Equal(t, map[string]interface{}{"consistency/allow": false}, *response.Output)
+}
+
+func TestProcessOpaDecision_ChildDecisionStaysItsOwn(t *testing.T) {
+	response, askedPath := decideNested(t, "onap/org/cell/consistency", `""`, map[string]interface{}{"allow": false}, "2.0.0")
+
+	assert.Equal(t, "onap/org/cell/consistency", askedPath)
+	require.NotNil(t, response.PolicyVersion)
+	assert.Equal(t, "2.0.0", *response.PolicyVersion)
+	require.NotNil(t, response.Output)
+	assert.Equal(t, map[string]interface{}{"allow": false}, *response.Output, "the parent's output is not mixed into the child's")
 }

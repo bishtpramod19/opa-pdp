@@ -24,19 +24,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/open-policy-agent/opa/sdk"
-	"github.com/open-policy-agent/opa/v1/storage"
-	"github.com/open-policy-agent/opa/v1/storage/inmem"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
-	"github.com/stretchr/testify/require"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"policy-opa-pdp/consts"
+	"strings"
 	"sync"
 	"testing"
+
+	"github.com/open-policy-agent/opa/sdk"
+	"github.com/open-policy-agent/opa/v1/ast"
+	"github.com/open-policy-agent/opa/v1/storage"
+	"github.com/open-policy-agent/opa/v1/storage/inmem"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 // Mock for os.Open
@@ -732,7 +735,15 @@ func TestDeleteData_Success(t *testing.T) {
 	mockMemStore.AssertExpectations(t)
 }
 
+// useEmptyPatchCompiler keeps a test that uses a mock store away from reading the live policies.
+func useEmptyPatchCompiler(t *testing.T) {
+	original := patchCompilerVar
+	t.Cleanup(func() { patchCompilerVar = original })
+	patchCompilerVar = func(context.Context, storage.Transaction) *ast.Compiler { return ast.NewCompiler() }
+}
+
 func TestPatchData_Success(t *testing.T) {
+	useEmptyPatchCompiler(t)
 	ctx := context.Background()
 	mockMemStore := new(MockStorage) // Create mock instance
 	memStore = mockMemStore
@@ -784,6 +795,7 @@ func TestPatchData_WriteError(t *testing.T) {
 }
 
 func TestPatchData_CommitError(t *testing.T) {
+	useEmptyPatchCompiler(t)
 	ctx := context.Background()
 	mockMemStore := new(MockStorage) // Create mock instance
 	memStore = mockMemStore
@@ -946,4 +958,369 @@ func TestGetDataInfo_HappyPathStillWorks(t *testing.T) {
 	got, err := GetDataInfo(context.Background(), "/plan13")
 	require.NoError(t, err)
 	require.NotNil(t, got)
+}
+
+// useRealStore runs a test against OPA's real in-memory store.
+func useRealStore(t *testing.T) context.Context {
+	original := memStore
+	t.Cleanup(func() { memStore = original })
+	memStore = inmem.New()
+	return context.Background()
+}
+
+func readJSON(t *testing.T, ctx context.Context, path string) (string, bool) {
+	txn, err := memStore.NewTransaction(ctx)
+	require.NoError(t, err)
+	defer memStore.Abort(ctx, txn)
+	value, err := memStore.Read(ctx, txn, storage.MustParsePath(path))
+	if storage.IsNotFound(err) {
+		return "", false
+	}
+	require.NoError(t, err)
+	encoded, err := json.Marshal(value)
+	require.NoError(t, err)
+	return string(encoded), true
+}
+
+func parseJSONValue(t *testing.T, content string) interface{} {
+	var value interface{}
+	require.NoError(t, json.Unmarshal([]byte(content), &value))
+	return value
+}
+
+var childFolder = []string{"node", "onap", "org", "cell", "consistency"}
+
+// Today's WriteData replaces everything at the path: a parent written after its child wipes the child.
+func TestWriteData_ParentAfterChildWipesChild(t *testing.T) {
+	ctx := useRealStore(t)
+	require.NoError(t, WriteData(ctx, "/node/onap/org/cell/consistency", parseJSONValue(t, `{"limit":1}`)))
+
+	require.NoError(t, WriteData(ctx, "/node/onap/org/cell", parseJSONValue(t, `{"threshold":5}`)))
+
+	_, found := readJSON(t, ctx, "/node/onap/org/cell/consistency")
+	assert.False(t, found, "this is the data loss WriteDataKeepingFolders exists to prevent")
+}
+
+func TestWriteDataKeepingFolders_ParentAfterChildKeepsChild(t *testing.T) {
+	ctx := useRealStore(t)
+	require.NoError(t, WriteData(ctx, "/node/onap/org/cell/consistency", parseJSONValue(t, `{"limit":1}`)))
+
+	err := WriteDataKeepingFolders(ctx, "/node/onap/org/cell", parseJSONValue(t, `{"threshold":5}`), [][]string{childFolder})
+
+	require.NoError(t, err)
+	parent, _ := readJSON(t, ctx, "/node/onap/org/cell")
+	assert.JSONEq(t, `{"threshold":5,"consistency":{"limit":1}}`, parent)
+}
+
+func TestWriteDataKeepingFolders_ParentRedeployReplacesOwnItemsOnly(t *testing.T) {
+	ctx := useRealStore(t)
+	require.NoError(t, WriteData(ctx, "/node/onap/org/cell", parseJSONValue(t, `{"threshold":5,"old":true}`)))
+	require.NoError(t, WriteData(ctx, "/node/onap/org/cell/consistency", parseJSONValue(t, `{"limit":1}`)))
+
+	err := WriteDataKeepingFolders(ctx, "/node/onap/org/cell", parseJSONValue(t, `{"threshold":9}`), [][]string{childFolder})
+
+	require.NoError(t, err)
+	parent, _ := readJSON(t, ctx, "/node/onap/org/cell")
+	assert.JSONEq(t, `{"threshold":9,"consistency":{"limit":1}}`, parent, "dropped item is gone, child is intact")
+}
+
+func TestWriteDataKeepingFolders_DeepFolderAndMissingFolder(t *testing.T) {
+	ctx := useRealStore(t)
+	deep := []string{"node", "onap", "org", "cell", "consistency", "rules"}
+	require.NoError(t, WriteData(ctx, "/node/onap/org/cell/consistency/rules", parseJSONValue(t, `{"r":1}`)))
+
+	err := WriteDataKeepingFolders(ctx, "/node/onap/org/cell", parseJSONValue(t, `{"threshold":5}`),
+		[][]string{deep, {"node", "onap", "org", "cell", "never", "deployed"}})
+
+	require.NoError(t, err)
+	parent, _ := readJSON(t, ctx, "/node/onap/org/cell")
+	assert.JSONEq(t, `{"threshold":5,"consistency":{"rules":{"r":1}}}`, parent, "missing intermediate folders are recreated, a folder with no data is skipped")
+}
+
+func TestWriteDataKeepingFolders_WritesIntoEmptyStore(t *testing.T) {
+	ctx := useRealStore(t)
+
+	require.NoError(t, WriteDataKeepingFolders(ctx, "/node/a/b", parseJSONValue(t, `{"x":1}`), nil))
+
+	value, found := readJSON(t, ctx, "/node/a/b")
+	assert.True(t, found)
+	assert.JSONEq(t, `{"x":1}`, value)
+}
+
+// All or nothing: when the kept folder cannot be put back, the child is still intact.
+func TestWriteDataKeepingFolders_FailureLeavesStoreUnchanged(t *testing.T) {
+	ctx := useRealStore(t)
+	require.NoError(t, WriteData(ctx, "/node/onap/org/cell", parseJSONValue(t, `{"threshold":5}`)))
+	require.NoError(t, WriteData(ctx, "/node/onap/org/cell/consistency", parseJSONValue(t, `{"limit":1}`)))
+
+	err := WriteDataKeepingFolders(ctx, "/node/onap/org/cell", parseJSONValue(t, `[1,2,3]`), [][]string{childFolder})
+
+	require.Error(t, err, "a folder cannot be kept inside a list")
+	parent, _ := readJSON(t, ctx, "/node/onap/org/cell")
+	assert.JSONEq(t, `{"threshold":5,"consistency":{"limit":1}}`, parent)
+}
+
+func TestWriteDataKeepingFolders_InvalidPathAndTransactionError(t *testing.T) {
+	ctx := useRealStore(t)
+	assert.Error(t, WriteDataKeepingFolders(ctx, "no-leading-slash/%zz", "x", nil))
+
+	mockMemStore := new(MockStorage)
+	memStore = mockMemStore
+	mockMemStore.On("NewTransaction", ctx, mock.Anything).Return(nil, errors.New("transaction error"))
+	err := WriteDataKeepingFolders(ctx, "/node/a", "x", nil)
+	require.Error(t, err)
+	assert.Equal(t, "transaction error", err.Error())
+}
+
+func TestRemoveOwnData_ParentLeavesChildData(t *testing.T) {
+	ctx := useRealStore(t)
+	require.NoError(t, WriteData(ctx, "/node/onap/org/cell", parseJSONValue(t, `{"threshold":5,"extra":{"a":1}}`)))
+	require.NoError(t, WriteData(ctx, "/node/onap/org/cell/consistency", parseJSONValue(t, `{"limit":1}`)))
+
+	err := RemoveOwnData(ctx, "/node/onap/org/cell", [][]string{childFolder}, nil)
+
+	require.NoError(t, err)
+	parent, found := readJSON(t, ctx, "/node/onap/org/cell")
+	require.True(t, found, "the folder stays because the child still needs it")
+	assert.JSONEq(t, `{"consistency":{"limit":1}}`, parent)
+}
+
+func TestRemoveOwnData_ChildLeavesParentData(t *testing.T) {
+	ctx := useRealStore(t)
+	require.NoError(t, WriteData(ctx, "/node/onap/org/cell", parseJSONValue(t, `{"threshold":5}`)))
+	require.NoError(t, WriteData(ctx, "/node/onap/org/cell/consistency", parseJSONValue(t, `{"limit":1}`)))
+
+	err := RemoveOwnData(ctx, "/node/onap/org/cell/consistency", nil, [][]string{{"node", "onap", "org", "cell"}})
+
+	require.NoError(t, err)
+	parent, _ := readJSON(t, ctx, "/node/onap/org/cell")
+	assert.JSONEq(t, `{"threshold":5}`, parent)
+}
+
+func TestRemoveOwnData_EmptyParentFoldersAreRemovedUnlessNeeded(t *testing.T) {
+	ctx := useRealStore(t)
+	require.NoError(t, WriteData(ctx, "/node/a/b/c", parseJSONValue(t, `{"x":1}`)))
+	require.NoError(t, RemoveOwnData(ctx, "/node/a/b/c", nil, nil))
+	_, found := readJSON(t, ctx, "/node")
+	assert.False(t, found, "emptied folders are pruned all the way up, as before")
+
+	require.NoError(t, WriteData(ctx, "/node/a/b/c", parseJSONValue(t, `{"x":1}`)))
+	require.NoError(t, RemoveOwnData(ctx, "/node/a/b/c", nil, [][]string{{"node", "a", "b"}}))
+	value, found := readJSON(t, ctx, "/node/a/b")
+	assert.True(t, found, "a folder another policy needs is kept even when empty")
+	assert.JSONEq(t, `{}`, value)
+}
+
+func TestRemoveOwnData_SiblingFolderKeepsParentsAlive(t *testing.T) {
+	ctx := useRealStore(t)
+	require.NoError(t, WriteData(ctx, "/node/onap/org/cell", parseJSONValue(t, `{"x":1}`)))
+	require.NoError(t, WriteData(ctx, "/node/onap/org/dog", parseJSONValue(t, `{"y":1}`)))
+
+	require.NoError(t, RemoveOwnData(ctx, "/node/onap/org/cell", nil, nil))
+
+	_, found := readJSON(t, ctx, "/node/onap/org/cell")
+	assert.False(t, found)
+	dog, found := readJSON(t, ctx, "/node/onap/org/dog")
+	assert.True(t, found)
+	assert.JSONEq(t, `{"y":1}`, dog)
+}
+
+func TestRemoveOwnData_MissingDataAndPlainValue(t *testing.T) {
+	ctx := useRealStore(t)
+	assert.NoError(t, RemoveOwnData(ctx, "/node/never/was", nil, nil), "data that is already gone is not an error")
+
+	require.NoError(t, WriteData(ctx, "/node/list", parseJSONValue(t, `[1,2]`)))
+	require.NoError(t, RemoveOwnData(ctx, "/node/list", nil, nil))
+	_, found := readJSON(t, ctx, "/node/list")
+	assert.False(t, found)
+
+	assert.Error(t, RemoveOwnData(ctx, "bad/%zz", nil, nil))
+}
+
+func TestRemoveOwnData_TransactionError(t *testing.T) {
+	ctx := context.Background()
+	original := memStore
+	t.Cleanup(func() { memStore = original })
+	mockMemStore := new(MockStorage)
+	memStore = mockMemStore
+	mockMemStore.On("NewTransaction", ctx, mock.Anything).Return(nil, errors.New("transaction error"))
+
+	err := RemoveOwnData(ctx, "/node/a", nil, nil)
+
+	require.Error(t, err)
+	assert.Equal(t, "transaction error", err.Error())
+}
+
+func TestDeletePolicyIfExists(t *testing.T) {
+	ctx := useRealStore(t)
+	require.NoError(t, UpsertPolicy(ctx, "onap.org.cell", []byte("package onap.org.cell\n")))
+
+	assert.NoError(t, DeletePolicyIfExists(ctx, "onap.org.cell"))
+	assert.NoError(t, DeletePolicyIfExists(ctx, "onap.org.cell"), "a module that is already gone is not an error")
+
+	txn, err := memStore.NewTransaction(ctx)
+	require.NoError(t, err)
+	defer memStore.Abort(ctx, txn)
+	ids, err := memStore.ListPolicies(ctx, txn)
+	require.NoError(t, err)
+	assert.Empty(t, ids)
+}
+
+func TestDeletePolicyIfExists_OtherErrorsStillReported(t *testing.T) {
+	ctx := context.Background()
+	original := memStore
+	t.Cleanup(func() { memStore = original })
+	mockMemStore := new(MockStorage)
+	memStore = mockMemStore
+	mockMemStore.On("NewTransaction", ctx, mock.Anything).Return(nil, errors.New("transaction error"))
+	mockMemStore.On("Abort", mock.Anything, mock.Anything).Return()
+
+	assert.Error(t, DeletePolicyIfExists(ctx, "x"))
+}
+
+func upsertModules(t *testing.T, ctx context.Context, modules map[string]string) {
+	for id, text := range modules {
+		require.NoError(t, UpsertPolicy(ctx, id, []byte(text)))
+	}
+}
+
+const childModule = "package onap.org.cell.consistency\n\nimport rego.v1\n\nallow if input.x == 1\n"
+
+func TestCompileWithLiveModules_NoStoreYet(t *testing.T) {
+	original := memStore
+	t.Cleanup(func() { memStore = original })
+	memStore = nil
+
+	assert.NoError(t, CompileWithLiveModules(context.Background(), map[string]string{"a": "package a\n"}))
+}
+
+func TestCompileWithLiveModules_ParentOverChildCompilesTogether(t *testing.T) {
+	ctx := useRealStore(t)
+	upsertModules(t, ctx, map[string]string{"onap.org.cell.consistency": childModule})
+
+	err := CompileWithLiveModules(ctx, map[string]string{
+		"onap.org.cell": "package onap.org.cell\n\nimport rego.v1\n\nthreshold := 5\n",
+	})
+
+	assert.NoError(t, err, "nested packages are fine in OPA")
+}
+
+// The clash OPA objects to: a rule of the parent that has the same path as the child's package.
+func TestCompileWithLiveModules_RuleClashesWithPackage(t *testing.T) {
+	ctx := useRealStore(t)
+	upsertModules(t, ctx, map[string]string{"onap.org.cell.consistency": childModule})
+
+	err := CompileWithLiveModules(ctx, map[string]string{
+		"onap.org.cell": "package onap.org.cell\n\nimport rego.v1\n\nconsistency := true\n",
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "conflicts with")
+	assert.Contains(t, err.Error(), "onap.org.cell")
+}
+
+func TestCompileWithLiveModules_ClashIsReportedInFull(t *testing.T) {
+	ctx := useRealStore(t)
+	upsertModules(t, ctx, map[string]string{"onap.org.cell.consistency": childModule})
+
+	err := CompileWithLiveModules(ctx, map[string]string{
+		"onap.org.cell": "package onap.org.cell\n\nimport rego.v1\n\nconsistency := true\n",
+	})
+
+	require.Error(t, err)
+	assert.Greater(t, len(err.Error()), 200, "the message is not cut short")
+	assert.True(t, strings.HasPrefix(err.Error(), "2 error(s) occurred: "), err.Error())
+	assert.Contains(t, err.Error(), "rule data.onap.org.cell.consistency conflicts with")
+	assert.Contains(t, err.Error(), "package onap.org.cell.consistency conflicts with rule consistency defined at onap.org.cell:5")
+}
+
+func TestCompileWithLiveModules_SameModuleIDReplacesLiveModule(t *testing.T) {
+	ctx := useRealStore(t)
+	upsertModules(t, ctx, map[string]string{
+		"onap.org.cell.consistency": childModule,
+		"onap.org.cell":             "package onap.org.cell\n\nimport rego.v1\n\nconsistency := true\n",
+	})
+
+	err := CompileWithLiveModules(ctx, map[string]string{
+		"onap.org.cell": "package onap.org.cell\n\nimport rego.v1\n\nthreshold := 5\n",
+	})
+
+	assert.NoError(t, err, "the redeployed module replaces the live one, so the old clash is gone")
+}
+
+func TestCompileWithLiveModules_ParseError(t *testing.T) {
+	ctx := useRealStore(t)
+
+	err := CompileWithLiveModules(ctx, map[string]string{"onap.org.cell": "package onap.org.cell\n\nthis is not rego {{{\n"})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rego_parse_error")
+}
+
+func TestCompileWithLiveModules_ExistingProblemIsNotBlamedOnTheCandidate(t *testing.T) {
+	ctx := useRealStore(t)
+	upsertModules(t, ctx, map[string]string{"broken.live": "package broken.live\n\nimport rego.v1\n\nx := undefined_thing\n"})
+
+	err := CompileWithLiveModules(ctx, map[string]string{"onap.org.cell": "package onap.org.cell\n\nimport rego.v1\n\nthreshold := 5\n"})
+
+	assert.NoError(t, err)
+}
+
+func TestCompileWithLiveModules_StoreReadFailure(t *testing.T) {
+	ctx := context.Background()
+	original := memStore
+	t.Cleanup(func() { memStore = original })
+	mockMemStore := new(MockStorage)
+	memStore = mockMemStore
+	mockMemStore.On("NewTransaction", ctx, mock.Anything).Return(nil, errors.New("transaction error"))
+
+	err := CompileWithLiveModules(ctx, map[string]string{"a": "package a\n"})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to read the deployed policies")
+}
+
+// The patch path conflict check now sees the live rules instead of an empty compiler.
+func TestPatchData_DetectsConflictWithLiveRule(t *testing.T) {
+	ctx := useRealStore(t)
+	upsertModules(t, ctx, map[string]string{"p.q": "package p\n\nimport rego.v1\n\nq := 1\n"})
+
+	err := PatchData(ctx, []PatchImpl{{Op: storage.AddOp, Path: storage.MustParsePath("/p/q"), Value: map[string]interface{}{"x": 1}}})
+
+	require.Error(t, err, "data written where a rule lives must be refused")
+	_, found := readJSON(t, ctx, "/p/q")
+	assert.False(t, found, "and nothing is written")
+}
+
+func TestPatchData_NoConflictStillWrites(t *testing.T) {
+	ctx := useRealStore(t)
+	upsertModules(t, ctx, map[string]string{"p.q": "package p\n\nimport rego.v1\n\nq := 1\n"})
+	require.NoError(t, WriteData(ctx, "/node/a", parseJSONValue(t, `{"x":1}`)))
+
+	err := PatchData(ctx, []PatchImpl{{Op: storage.AddOp, Path: storage.MustParsePath("/node/a/y"), Value: 2}})
+
+	require.NoError(t, err)
+	value, _ := readJSON(t, ctx, "/node/a")
+	assert.JSONEq(t, `{"x":1,"y":2}`, value)
+}
+
+func TestLiveCompiler_FallsBackWhenPoliciesCannotBeRead(t *testing.T) {
+	ctx := context.Background()
+	original := memStore
+	t.Cleanup(func() { memStore = original })
+	mockMemStore := new(MockStorage)
+	memStore = mockMemStore
+	mockMemStore.On("ListPolicies", ctx, mock.Anything).Return([]string{}, errors.New("list error"))
+
+	compiler := liveCompiler(ctx, &MockTransaction{})
+
+	assert.NotNil(t, compiler, "patching must keep working when the policies cannot be read")
+	assert.Empty(t, compiler.Modules)
+}
+
+func TestHasSegmentPrefix_Local(t *testing.T) {
+	assert.True(t, hasSegmentPrefix([]string{"a", "b"}, []string{"a"}))
+	assert.True(t, hasSegmentPrefix([]string{"a"}, []string{"a"}))
+	assert.False(t, hasSegmentPrefix([]string{"a"}, []string{"a", "b"}))
+	assert.False(t, hasSegmentPrefix([]string{"ab"}, []string{"a"}))
 }

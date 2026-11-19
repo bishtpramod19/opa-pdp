@@ -28,18 +28,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"policy-opa-pdp/consts"
 	"policy-opa-pdp/pkg/log"
+	"slices"
 	"strings"
 	"sync"
+
+	"policy-opa-pdp/pkg/model/oapicodegen"
 
 	"github.com/open-policy-agent/opa/storage/inmem"
 	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/sdk"
 	"github.com/open-policy-agent/opa/v1/storage"
-	"policy-opa-pdp/pkg/model/oapicodegen"
 )
 
 // Define the structs
@@ -50,11 +53,23 @@ var (
 	initErr         error
 	UpsertPolicyVar UpsertPolicyFunc = UpsertPolicy
 	WriteDataVar    WriteDataFunc    = WriteData
+
+	WriteDataKeepingFoldersVar WriteDataKeepingFoldersFunc = WriteDataKeepingFolders
+	CompileWithLiveModulesVar  CompileWithLiveModulesFunc  = CompileWithLiveModules
+	RemoveOwnDataVar           RemoveOwnDataFunc           = RemoveOwnData
+	DeletePolicyIfExistsVar    DeletePolicyIfExistsFunc    = DeletePolicyIfExists
+	patchCompilerVar           patchCompilerFunc           = liveCompiler
 )
 
 type (
 	UpsertPolicyFunc func(ctx context.Context, policyID string, policyContent []byte) error
 	WriteDataFunc    func(ctx context.Context, dataPath string, data interface{}) error
+
+	WriteDataKeepingFoldersFunc func(ctx context.Context, dataPath string, data interface{}, keepFolders [][]string) error
+	CompileWithLiveModulesFunc  func(ctx context.Context, candidates map[string]string) error
+	RemoveOwnDataFunc           func(ctx context.Context, dataPath string, protectedFolders, neededFolders [][]string) error
+	DeletePolicyIfExistsFunc    func(ctx context.Context, policyID string) error
+	patchCompilerFunc           func(ctx context.Context, txn storage.Transaction) *ast.Compiler
 )
 
 type PatchImpl struct {
@@ -321,8 +336,8 @@ func PatchData(ctx context.Context, patches []PatchImpl) error {
 		}
 	}
 
-	// Create a new compiler instance
-	compiler := ast.NewCompiler()
+	// Compiler holding the live policies, so that path conflicts with their rules are detected
+	compiler := patchCompilerVar(ctx, txn)
 
 	// Check for path conflicts
 	errInfo := ast.CheckPathConflicts(compiler, storage.NonEmpty(ctx, memStore, txn))
@@ -358,7 +373,7 @@ func GetDataInfo(ctx context.Context, dataPath string) (data *oapicodegen.OPADat
 
 	result, err := memStore.Read(ctx, rtxn, path)
 	if err != nil {
-		log.Warnf("Error in reading data under " + dataPath + " path")
+		log.Warnf("Error in reading data under %s path", dataPath)
 		return nil, err
 	}
 
@@ -408,4 +423,288 @@ func ParsePatchPathEscaped(str string) (path storage.Path, ok bool) {
 	}
 
 	return
+}
+
+// DeletePolicyIfExists deletes a policy module by its ID.
+func DeletePolicyIfExists(ctx context.Context, policyID string) error {
+	err := DeletePolicy(ctx, policyID)
+	if err != nil && storage.IsNotFound(err) {
+		log.Debugf("Policy %s is not in the store, nothing to delete", policyID)
+		return nil
+	}
+	return err
+}
+
+// writes the parent’s data at its path, but first remembers the child’s folder and puts it back after.
+//
+//	All of it is one transaction, so it is all or nothing. A failure halfway leaves the store as it was.
+func WriteDataKeepingFolders(ctx context.Context, dataPath string, data interface{}, keepFolders [][]string) error {
+	txn, err := memStore.NewTransaction(ctx, storage.WriteParams)
+	if err != nil {
+		log.Warnf("Error creating transaction while writing data keeping folders: %s", err)
+		return err
+	}
+	if err := replaceDataKeepingNestedFolders(ctx, txn, dataPath, data, keepFolders); err != nil {
+		log.Warnf("Error writing data keeping folders under %s: %s", dataPath, err)
+		memStore.Abort(ctx, txn)
+		return err
+	}
+	if err := memStore.Commit(ctx, txn); err != nil {
+		log.Warnf("Error commiting the transaction while writing data keeping folders: %s", err)
+		memStore.Abort(ctx, txn)
+		return err
+	}
+	return nil
+}
+
+type keptFolder struct {
+	path  storage.Path
+	value any
+}
+
+func replaceDataKeepingNestedFolders(ctx context.Context, txn storage.Transaction, dataPath string, data any, keepFolders [][]string) error {
+	parsedPath, ok := storage.ParsePath(dataPath)
+	if !ok {
+		return fmt.Errorf("invalid data path: %s", dataPath)
+	}
+	kept, err := readKeptFolders(ctx, txn, keepFolders)
+	if err != nil {
+		return err
+	}
+	if err := initializePath(ctx, txn, dataPath); err != nil {
+		return err
+	}
+	if err := memStore.Write(ctx, txn, storage.AddOp, parsedPath, data); err != nil {
+		return err
+	}
+	return restoreKeptFolders(ctx, txn, kept)
+}
+
+// readKeptFolders reads the child folders that has data
+func readKeptFolders(ctx context.Context, txn storage.Transaction, keepFolders [][]string) ([]keptFolder, error) {
+	kept := make([]keptFolder, 0, len(keepFolders))
+	for _, folder := range keepFolders {
+		path := storage.Path(slices.Clone(folder))
+		value, err := memStore.Read(ctx, txn, path)
+		if storage.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		kept = append(kept, keptFolder{path: path, value: value})
+	}
+	return kept, nil
+}
+
+func restoreKeptFolders(ctx context.Context, txn storage.Transaction, kept []keptFolder) error {
+	for _, folder := range kept {
+		if err := initializePath(ctx, txn, folder.path.String()); err != nil {
+			return err
+		}
+		if err := memStore.Write(ctx, txn, storage.AddOp, folder.path, folder.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RemoveOwnData removes the policy’s own data and nothing else, then tidies empty parent folders.
+func RemoveOwnData(ctx context.Context, dataPath string, protectedFolders, neededFolders [][]string) error {
+	path, ok := storage.ParsePath(dataPath)
+	if !ok {
+		return fmt.Errorf("invalid data path: %s", dataPath)
+	}
+	txn, err := memStore.NewTransaction(ctx, storage.WriteParams)
+	if err != nil {
+		log.Warnf("Error creating transaction while removing own data: %s", err)
+		return err
+	}
+	if err := removeOwnItems(ctx, txn, path, protectedFolders); err != nil {
+		memStore.Abort(ctx, txn)
+		return err
+	}
+	if err := pruneEmptyParents(ctx, txn, path, neededFolders); err != nil {
+		memStore.Abort(ctx, txn)
+		return err
+	}
+	if err := memStore.Commit(ctx, txn); err != nil {
+		log.Warnf("Error commiting the transaction while removing own data: %s", err)
+		memStore.Abort(ctx, txn)
+		return err
+	}
+	return nil
+}
+
+func removeOwnItems(ctx context.Context, txn storage.Transaction, path storage.Path, protectedFolders [][]string) error {
+	value, err := memStore.Read(ctx, txn, path)
+	if storage.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	object, isObject := value.(map[string]interface{})
+	if !isObject {
+		return removeIfPresent(ctx, txn, path)
+	}
+	keptItems := 0
+	for _, name := range slices.Sorted(maps.Keys(object)) {
+		itemPath := append(slices.Clone(path), name)
+		if isProtected(itemPath, protectedFolders) {
+			keptItems++
+			continue
+		}
+		if err := removeIfPresent(ctx, txn, itemPath); err != nil {
+			return err
+		}
+	}
+	if keptItems == 0 {
+		return removeIfPresent(ctx, txn, path)
+	}
+	return nil
+}
+
+// isProtected reports is this path a child’s folder or not
+func isProtected(path storage.Path, protectedFolders [][]string) bool {
+	return slices.ContainsFunc(protectedFolders, func(folder []string) bool {
+		return hasSegmentPrefix(folder, path)
+	})
+}
+
+// hasSegmentPrefix reports whether path starts with every segment of prefix.
+func hasSegmentPrefix(path, prefix []string) bool {
+	return len(prefix) <= len(path) && slices.Equal(path[:len(prefix)], prefix)
+}
+
+func removeIfPresent(ctx context.Context, txn storage.Transaction, path storage.Path) error {
+	err := memStore.Write(ctx, txn, storage.RemoveOp, slices.Clone(path), nil)
+	if err != nil && !storage.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+// pruneEmptyParents removes the parent folders of path one by one for as long as they are
+// empty and not needed by another policy.
+func pruneEmptyParents(ctx context.Context, txn storage.Transaction, path storage.Path, neededFolders [][]string) error {
+	for parent := path[:max(len(path)-1, 0)]; len(parent) > 0; parent = parent[:len(parent)-1] {
+		gone, err := removeIfEmptyAndUnneeded(ctx, txn, slices.Clone(parent), neededFolders)
+		if err != nil || !gone {
+			return err
+		}
+	}
+	return nil
+}
+
+// removeIfEmptyAndUnneeded returns true when the folder is gone
+func removeIfEmptyAndUnneeded(ctx context.Context, txn storage.Transaction, path storage.Path, neededFolders [][]string) (bool, error) {
+	value, err := memStore.Read(ctx, txn, path)
+	if storage.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	object, isObject := value.(map[string]any)
+	if !isObject || len(object) > 0 || slices.ContainsFunc(neededFolders, func(folder []string) bool { return slices.Equal(folder, path) }) {
+		return false, nil
+	}
+	return true, removeIfPresent(ctx, txn, path)
+}
+
+// CompileWithLiveModules compiles the candidate policy modules together with the policies
+// that are live,  Nothing is written to the store.
+func CompileWithLiveModules(ctx context.Context, candidates map[string]string) error {
+	if memStore == nil {
+		return nil
+	}
+	live, err := readLivePolicyTexts(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to read the deployed policies: %w", err)
+	}
+	combined := maps.Clone(live)
+	maps.Copy(combined, candidates)
+	return newCompileErrors(compileMessages(live), compileMessages(combined))
+}
+
+func readLivePolicyTexts(ctx context.Context) (map[string]string, error) {
+	txn, err := memStore.NewTransaction(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer memStore.Abort(ctx, txn)
+	return policyTexts(ctx, txn)
+}
+
+// policyTexts returns the text of every policy module in the store, by module ID.
+func policyTexts(ctx context.Context, txn storage.Transaction) (map[string]string, error) {
+	ids, err := memStore.ListPolicies(ctx, txn)
+	if err != nil {
+		return nil, err
+	}
+	texts := make(map[string]string, len(ids))
+	for _, id := range ids {
+		content, err := memStore.GetPolicy(ctx, txn, id)
+		if err != nil {
+			return nil, err
+		}
+		texts[id] = string(content)
+	}
+	return texts, nil
+}
+
+// compileMessages parses and compiles the modules and returns the text of every error found.
+func compileMessages(texts map[string]string) []string {
+	modules, messages := parseModules(texts)
+	compiler := ast.NewCompiler().WithDefaultRegoVersion(ast.RegoV1)
+	compiler.Compile(modules)
+	for _, compileErr := range compiler.Errors {
+		messages = append(messages, compileErr.Error())
+	}
+	return messages
+}
+
+func parseModules(texts map[string]string) (map[string]*ast.Module, []string) {
+	modules := make(map[string]*ast.Module, len(texts))
+	var messages []string
+	for _, id := range slices.Sorted(maps.Keys(texts)) {
+		module, err := ast.ParseModuleWithOpts(id, texts[id], ast.ParserOptions{RegoVersion: ast.RegoV1})
+		if err != nil {
+			messages = append(messages, err.Error())
+			continue
+		}
+		if module != nil {
+			modules[id] = module
+		}
+	}
+	return modules, messages
+}
+
+// newCompileErrors returns only the errors the candidate causes,
+// it is basically to return the full error text
+func newCompileErrors(baseline, combined []string) error {
+	var fresh []string
+	for _, message := range combined {
+		if !slices.Contains(baseline, message) {
+			fresh = append(fresh, message)
+		}
+	}
+	if len(fresh) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%d error(s) occurred: %s", len(fresh), strings.Join(fresh, "; "))
+}
+
+// liveCompiler returns a compiler holding the live policies
+func liveCompiler(ctx context.Context, txn storage.Transaction) *ast.Compiler {
+	texts, err := policyTexts(ctx, txn)
+	if err != nil {
+		log.Warnf("Could not read the live policies for the patch conflict check: %s", err)
+		return ast.NewCompiler()
+	}
+	modules, _ := parseModules(texts)
+	compiler := ast.NewCompiler().WithDefaultRegoVersion(ast.RegoV1)
+	compiler.Compile(modules)
+	return compiler
 }

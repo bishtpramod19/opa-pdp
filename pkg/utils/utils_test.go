@@ -20,34 +20,18 @@ package utils
 
 import (
 	"fmt"
-	"github.com/google/uuid"
-	openapi_types "github.com/oapi-codegen/runtime/types"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"policy-opa-pdp/pkg/model"
 	"policy-opa-pdp/pkg/model/oapicodegen"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	openapi_types "github.com/oapi-codegen/runtime/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
-
-func mockCmd(command string, args ...string) *exec.Cmd {
-	cs := []string{"-test.run=TestHelperProcess", "--", command}
-	cs = append(cs, args...)
-	cmd := exec.Command(os.Args[0], cs...)
-	cmd.Env = []string{"GO_WANT_HELPER_PROCESS=1"}
-	return cmd
-}
-
-// TestHelperProcess is a helper process used by mockCmd
-func TestHelperProcess(*testing.T) {
-	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
-		return
-	}
-	os.Exit(0)
-}
 
 // Positive Test Case: Valid UUIDs
 func TestIsValidUUIDPositive(t *testing.T) {
@@ -238,14 +222,14 @@ func TestIsPolicyNameAllowed_Positive(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// Negative test cases for IsPolicyNameAllowed (Parent policy exists)
+// Nested policies are allowed: a child name is accepted when its parent is already deployed
 func TestIsPolicyNameAllowed_Negative(t *testing.T) {
 	policy := model.ToscaPolicy{Name: "policy.test"}
 	deployedPolicies := []map[string]interface{}{{"policy-id": "policy"}}
 
 	allowed, err := IsPolicyNameAllowed(policy, deployedPolicies)
-	assert.False(t, allowed)
-	assert.Error(t, err)
+	assert.True(t, allowed)
+	assert.NoError(t, err)
 }
 
 func TestIsPolicyNameAllowed_ParentOfExistingPolicy(t *testing.T) {
@@ -256,9 +240,8 @@ func TestIsPolicyNameAllowed_ParentOfExistingPolicy(t *testing.T) {
 	}
 
 	allowed, err := IsPolicyNameAllowed(policy, deployedPolicies)
-	assert.Error(t, err)
-	assert.False(t, allowed, "Expected validation to fail due to parent policy conflict")
-	assert.Contains(t, err.Error(), "policy Validation Failed : Policy-id: test.policy is parent  of deployed policy, overrides existing policy: test.policy.1")
+	assert.NoError(t, err)
+	assert.True(t, allowed, "Expected a parent policy to be allowed when its child is already deployed")
 }
 
 func TestIsPolicyNameAllowed_ChildOfExistingPolicy(t *testing.T) {
@@ -269,9 +252,8 @@ func TestIsPolicyNameAllowed_ChildOfExistingPolicy(t *testing.T) {
 	}
 
 	allowed, err := IsPolicyNameAllowed(policy, deployedPolicies)
-	assert.Error(t, err)
-	assert.False(t, allowed, "Expected validation to fail due to child policy conflict")
-	assert.Contains(t, err.Error(), "policy Validation Failed:  Policy-id: test.policy.1.1 is child  of deployed policy , can overwrite existing policy: test.policy.1")
+	assert.NoError(t, err)
+	assert.True(t, allowed, "Expected a child policy to be allowed when its parent is already deployed")
 }
 
 func TestIsPolicyNameAllowed_NoDeployedPolicies(t *testing.T) {
@@ -582,30 +564,6 @@ func TestIsValidString(t *testing.T) {
 	}
 }
 
-func TestBuildBundle(t *testing.T) {
-	output, err := BuildBundle(mockCmd)
-	if err != nil {
-		t.Errorf("BuildBundle() error = %v, wantErr %v", err, output)
-	}
-}
-
-func TestBuildBundle_CommandFailure(t *testing.T) {
-	// Mock function to simulate command failure
-	mockCmdFail := func(command string, args ...string) *exec.Cmd {
-		cs := []string{"-test.run=TestHelperProcess", "--", command}
-		cs = append(cs, args...)
-		cmd := exec.Command(os.Args[0], cs...)
-		cmd.Env = []string{"GO_WANT_HELPER_PROCESS=1"}
-		cmd.Stderr = os.Stderr
-		return cmd
-	}
-
-	output, err := BuildBundle(mockCmdFail)
-	if err == nil {
-		t.Errorf("BuildBundle() error = nil, wantErr %v", output)
-	}
-}
-
 // Test function for isSubDirEmpty using real directories
 func TestIsSubDirEmpty(t *testing.T) {
 	// Create a temporary directory for testing
@@ -850,4 +808,290 @@ func TestValidateKeys(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Test IsKeyOwnedByPolicy: ownership is judged on a dot boundary, not on plain text.
+func TestIsKeyOwnedByPolicy(t *testing.T) {
+	tests := []struct {
+		name       string
+		key        string
+		policyName string
+		want       bool
+	}{
+		{"Exact match", "onap.org.cell", "onap.org.cell", true},
+		{"Direct child key", "onap.org.cell.consistency", "onap.org.cell", true},
+		{"Deeply nested child key", "onap.org.cell.consistency.rules", "onap.org.cell", true},
+		{"Data key exact match", "node.onap.org.cell", "node.onap.org.cell", true},
+		{"Data child key", "node.onap.org.cell.consistency", "node.onap.org.cell", true},
+		{"Look-alike sibling is not owned", "onap.org.cellular", "onap.org.cell", false},
+		{"Look-alike child of sibling is not owned", "onap.org.cellular.x", "onap.org.cell", false},
+		{"Hyphen suffix is not a dot boundary", "test-policy-rule", "test-policy", false},
+		{"Parent key is not owned by its child", "onap.org.cell", "onap.org.cell.consistency", false},
+		{"Unrelated key", "other.policy", "onap.org.cell", false},
+		{"Trailing dot with nothing after it", "onap.org.cell.", "onap.org.cell", false},
+		{"Empty key", "", "onap.org.cell", false},
+		{"Empty policy name", "onap.org.cell", "", false},
+		{"Both empty", "", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, IsKeyOwnedByPolicy(tt.key, tt.policyName))
+		})
+	}
+}
+
+func TestHasSegmentPrefix(t *testing.T) {
+	assert.True(t, HasSegmentPrefix([]string{"node", "a", "b"}, []string{"node", "a"}))
+	assert.True(t, HasSegmentPrefix([]string{"node", "a"}, []string{"node", "a"}))
+	assert.True(t, HasSegmentPrefix([]string{"node"}, []string{}))
+	assert.False(t, HasSegmentPrefix([]string{"node", "a"}, []string{"node", "a", "b"}))
+	assert.False(t, HasSegmentPrefix([]string{"node", "cellular"}, []string{"node", "cell"}), "a longer name is not inside a shorter one")
+}
+
+// The owner of a key is the deployed policy with the longest matching name.
+func TestFindKeyOwner(t *testing.T) {
+	names := []string{"onap.org.cell", "onap.org.cell.consistency", "onap.org.cellular"}
+
+	tests := []struct {
+		name      string
+		key       string
+		keyPrefix string
+		want      string
+	}{
+		{"Key of the parent", "onap.org.cell", "", "onap.org.cell"},
+		{"Key of the child belongs to the child, not the parent", "onap.org.cell.consistency", "", "onap.org.cell.consistency"},
+		{"Deeper key of the child", "onap.org.cell.consistency.rules", "", "onap.org.cell.consistency"},
+		{"Key inside the parent but outside the child", "onap.org.cell.other", "", "onap.org.cell"},
+		{"Look-alike sibling is its own owner", "onap.org.cellular", "", "onap.org.cellular"},
+		{"Data key of the child", "node.onap.org.cell.consistency", DataKeyPrefix, "onap.org.cell.consistency"},
+		{"Data key of the parent", "node.onap.org.cell", DataKeyPrefix, "onap.org.cell"},
+		{"Key nobody owns", "other.policy", "", ""},
+		{"Hyphenated key is nobody's", "onap.org.cell-v2", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, FindKeyOwner(tt.key, tt.keyPrefix, names))
+		})
+	}
+}
+
+func newNestedTestPolicy(name string, policyKeys, dataKeys []string) model.ToscaPolicy {
+	policy := model.ToscaPolicy{Name: name}
+	policy.Properties.Policy = map[string]string{}
+	policy.Properties.Data = map[string]string{}
+	for _, key := range policyKeys {
+		policy.Properties.Policy[key] = "cG9saWN5"
+	}
+	for _, key := range dataKeys {
+		policy.Properties.Data[key] = "e30="
+	}
+	return policy
+}
+
+// A deployment may only use keys that belong to itself; clashes name the owning policy.
+func TestValidateKeyOwnership(t *testing.T) {
+	tests := []struct {
+		name     string
+		policy   model.ToscaPolicy
+		deployed []string
+		wantErr  string
+	}{
+		{"No policy deployed", newNestedTestPolicy("onap.org.cell", []string{"onap.org.cell"}, []string{"node.onap.org.cell"}), nil, ""},
+		{"Parent arrives after child, own keys only",
+			newNestedTestPolicy("onap.org.cell", []string{"onap.org.cell"}, []string{"node.onap.org.cell"}),
+			[]string{"onap.org.cell.consistency"}, ""},
+		{"Child arrives after parent, own keys only",
+			newNestedTestPolicy("onap.org.cell.consistency", []string{"onap.org.cell.consistency"}, []string{"node.onap.org.cell.consistency"}),
+			[]string{"onap.org.cell"}, ""},
+		{"Parent submits a policy key that is the child's key",
+			newNestedTestPolicy("onap.org.cell", []string{"onap.org.cell", "onap.org.cell.consistency"}, nil),
+			[]string{"onap.org.cell.consistency"},
+			"policy key 'onap.org.cell.consistency' of policy 'onap.org.cell' belongs to deployed policy 'onap.org.cell.consistency'"},
+		{"Parent adds a module inside the child's package",
+			newNestedTestPolicy("onap.org.cell", []string{"onap.org.cell", "onap.org.cell.consistency.extra"}, nil),
+			[]string{"onap.org.cell.consistency"},
+			"belongs to deployed policy 'onap.org.cell.consistency'"},
+		{"Parent submits a data key that is the child's data key",
+			newNestedTestPolicy("onap.org.cell", []string{"onap.org.cell"}, []string{"node.onap.org.cell", "node.onap.org.cell.consistency"}),
+			[]string{"onap.org.cell.consistency"},
+			"data key 'node.onap.org.cell.consistency' of policy 'onap.org.cell' belongs to deployed policy 'onap.org.cell.consistency'"},
+		{"Policy submits the key of a look-alike sibling",
+			newNestedTestPolicy("onap.org.cell", []string{"onap.org.cell", "onap.org.cellular"}, nil),
+			[]string{"onap.org.cellular"},
+			"policy key 'onap.org.cellular' of policy 'onap.org.cell' belongs to deployed policy 'onap.org.cellular'"},
+		{"Hyphenated key of an unrelated name is still accepted",
+			newNestedTestPolicy("test-policy", []string{"test-policy-rule"}, []string{"node.test-policy"}),
+			[]string{"other"}, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateKeyOwnership(tt.policy, tt.deployed)
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+func TestTopLevelItemNames(t *testing.T) {
+	assert.Equal(t, []string{"a", "b"}, TopLevelItemNames(`{"b":1,"a":{"x":2}}`))
+	assert.Empty(t, TopLevelItemNames(`{}`), "an empty object has no items")
+	assert.Nil(t, TopLevelItemNames(`[1,2]`), "an array has no named items")
+	assert.Nil(t, TopLevelItemNames(`"text"`))
+	assert.Nil(t, TopLevelItemNames(`{not json`))
+}
+
+// Content clash: a data item of the parent must not land on the child's data.
+func TestValidateDataItemsAvailable(t *testing.T) {
+	other := map[string][]string{"onap.org.cell.consistency": {"node.onap.org.cell.consistency"}}
+
+	t.Run("Item named like the child's folder is rejected", func(t *testing.T) {
+		err := ValidateDataItemsAvailable("node.onap.org.cell", []string{"threshold", "consistency"}, other)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "data item 'consistency' of data key 'node.onap.org.cell' would replace the data of deployed policy 'onap.org.cell.consistency'")
+	})
+	t.Run("Items that do not touch the child are accepted", func(t *testing.T) {
+		assert.NoError(t, ValidateDataItemsAvailable("node.onap.org.cell", []string{"threshold", "limits"}, other))
+	})
+	t.Run("A longer item name is not the child's folder", func(t *testing.T) {
+		assert.NoError(t, ValidateDataItemsAvailable("node.onap.org.cell", []string{"consistency2"}, other))
+	})
+	t.Run("A child without data keys cannot be clashed with", func(t *testing.T) {
+		assert.NoError(t, ValidateDataItemsAvailable("node.onap.org.cell", []string{"consistency"}, map[string][]string{"onap.org.cell.consistency": {}}))
+	})
+	t.Run("An item above a deeper child is rejected too", func(t *testing.T) {
+		deep := map[string][]string{"onap.org.cell.consistency.rules": {"node.onap.org.cell.consistency.rules"}}
+		assert.Error(t, ValidateDataItemsAvailable("node.onap.org.cell", []string{"consistency"}, deep))
+	})
+	t.Run("No other policy", func(t *testing.T) {
+		assert.NoError(t, ValidateDataItemsAvailable("node.onap.org.cell", []string{"consistency"}, nil))
+	})
+}
+
+// Content clash the other way round: a child must not be written where the parent already has an item.
+func TestValidateDataKeyNotOccupied(t *testing.T) {
+	occupied := map[string]map[string][]string{
+		"onap.org.cell": {"node.onap.org.cell": {"threshold", "consistency"}},
+	}
+
+	t.Run("Child folder is already an item of the parent", func(t *testing.T) {
+		err := ValidateDataKeyNotOccupied("node.onap.org.cell.consistency", occupied)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "data key 'node.onap.org.cell.consistency' is already used by data item 'node.onap.org.cell.consistency' of deployed policy 'onap.org.cell'")
+	})
+	t.Run("Deeper key below the occupied item is rejected too", func(t *testing.T) {
+		assert.Error(t, ValidateDataKeyNotOccupied("node.onap.org.cell.consistency.rules", occupied))
+	})
+	t.Run("Free folder is accepted", func(t *testing.T) {
+		assert.NoError(t, ValidateDataKeyNotOccupied("node.onap.org.cell.other", occupied))
+	})
+	t.Run("Look-alike folder is accepted", func(t *testing.T) {
+		assert.NoError(t, ValidateDataKeyNotOccupied("node.onap.org.cell.consistency2", occupied))
+	})
+	t.Run("Nothing recorded", func(t *testing.T) {
+		assert.NoError(t, ValidateDataKeyNotOccupied("node.onap.org.cell.consistency", nil))
+	})
+}
+
+func TestChildPolicyNames(t *testing.T) {
+	deployed := []string{"onap.org.cell.consistency", "onap.org.cell", "onap.org.cellular", "onap.org.cell.consistency.rules", "onap.org.cell.a", "other"}
+
+	assert.Equal(t,
+		[]string{"onap.org.cell.consistency.rules", "onap.org.cell.a", "onap.org.cell.consistency"},
+		ChildPolicyNames("onap.org.cell", deployed), "deepest first, look-alike and the parent itself left out")
+	assert.Equal(t, []string{"onap.org.cell.consistency.rules"}, ChildPolicyNames("onap.org.cell.consistency", deployed))
+	assert.Empty(t, ChildPolicyNames("onap.org.cell.consistency.rules", deployed))
+	assert.Empty(t, ChildPolicyNames("other", deployed))
+}
+
+func TestTopmostPaths(t *testing.T) {
+	paths := [][]string{{"node", "a", "b"}, {"node", "a"}, {"node", "c"}, {"node", "c"}, {"node", "d", "e"}}
+
+	assert.Equal(t, [][]string{{"node", "a"}, {"node", "c"}, {"node", "d", "e"}}, TopmostPaths(paths))
+	assert.Empty(t, TopmostPaths(nil))
+}
+
+// Only the file asked for is removed; folders are pruned only while they are empty.
+func TestRemoveFileAndEmptyParents(t *testing.T) {
+	root := t.TempDir()
+	write := func(relative string) string {
+		full := filepath.Join(root, relative)
+		require.NoError(t, os.MkdirAll(filepath.Dir(full), 0750))
+		require.NoError(t, os.WriteFile(full, []byte("x"), 0600))
+		return full
+	}
+	exists := func(relative string) bool {
+		_, err := os.Stat(filepath.Join(root, relative))
+		return err == nil
+	}
+
+	t.Run("Parent policy file leaves the child's file and folders alone", func(t *testing.T) {
+		parent := write("onap/org/cell/policy.rego")
+		write("onap/org/cell/consistency/policy.rego")
+
+		require.NoError(t, RemoveFileAndEmptyParents(parent, root))
+
+		assert.False(t, exists("onap/org/cell/policy.rego"))
+		assert.True(t, exists("onap/org/cell/consistency/policy.rego"), "the child's file must survive")
+	})
+	t.Run("Empty folders are removed up to, but not including, the stop folder", func(t *testing.T) {
+		only := write("solo/deep/er/policy.rego")
+
+		require.NoError(t, RemoveFileAndEmptyParents(only, root))
+
+		assert.False(t, exists("solo"), "emptied folders are removed")
+		assert.True(t, exists(""), "the stop folder is kept")
+	})
+	t.Run("A folder shared with another policy is kept", func(t *testing.T) {
+		mine := write("shared/mine/policy.rego")
+		write("shared/theirs/policy.rego")
+
+		require.NoError(t, RemoveFileAndEmptyParents(mine, root))
+
+		assert.False(t, exists("shared/mine"))
+		assert.True(t, exists("shared/theirs/policy.rego"))
+	})
+	t.Run("A missing file is not an error", func(t *testing.T) {
+		assert.NoError(t, RemoveFileAndEmptyParents(filepath.Join(root, "never", "was", "here.rego"), root))
+	})
+	t.Run("A failing removal is reported", func(t *testing.T) {
+		original := removeFile
+		defer func() { removeFile = original }()
+		removeFile = func(string) error { return fmt.Errorf("disk error") }
+
+		err := RemoveFileAndEmptyParents(filepath.Join(root, "x", "policy.rego"), root)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "disk error")
+	})
+}
+
+// Patch: which policy's data a path is.
+func TestOtherPolicyHoldingPath(t *testing.T) {
+	others := map[string][]string{"onap.org.cell.consistency": {"node.onap.org.cell.consistency"}, "onap.org.cellular": {"node.onap.org.cellular"}}
+	own := []string{"node.onap.org.cell"}
+
+	assert.Equal(t, "onap.org.cell.consistency", OtherPolicyHoldingPath([]string{"node", "onap", "org", "cell", "consistency", "limit"}, own, others),
+		"a path inside the child's data is the child's, not the parent's")
+	assert.Equal(t, "onap.org.cell.consistency", OtherPolicyHoldingPath([]string{"node", "onap", "org", "cell", "consistency"}, own, others))
+	assert.Equal(t, "", OtherPolicyHoldingPath([]string{"node", "onap", "org", "cell", "threshold"}, own, others), "the parent's own data")
+	assert.Equal(t, "", OtherPolicyHoldingPath([]string{"node", "onap", "org", "cell", "consistency2"}, own, others), "a longer name is not the child's folder")
+	assert.Equal(t, "", OtherPolicyHoldingPath([]string{"node", "onap", "org", "cell", "consistency", "limit"},
+		[]string{"node.onap.org.cell.consistency"}, others), "the child itself may change its own data")
+	assert.Equal(t, "", OtherPolicyHoldingPath([]string{"node", "a"}, nil, nil))
+}
+
+func TestOtherPolicyUnderPath(t *testing.T) {
+	others := map[string][]string{"onap.org.cell.consistency": {"node.onap.org.cell.consistency"}}
+
+	assert.Equal(t, "onap.org.cell.consistency", OtherPolicyUnderPath([]string{"node", "onap", "org", "cell", "consistency"}, others), "exactly the child's folder")
+	assert.Equal(t, "onap.org.cell.consistency", OtherPolicyUnderPath([]string{"node", "onap", "org", "cell"}, others), "a path above the child covers it")
+	assert.Equal(t, "", OtherPolicyUnderPath([]string{"node", "onap", "org", "cell", "threshold"}, others))
+	assert.Equal(t, "", OtherPolicyUnderPath([]string{"node", "onap", "org", "cell", "consistency", "limit"}, others), "inside the child is not above it")
 }

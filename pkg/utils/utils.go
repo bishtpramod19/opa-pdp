@@ -1,6 +1,6 @@
 // -
 //   ========================LICENSE_START=================================
-//   Copyright (C) 2024-2025: Deutsche Telekom
+//   Copyright (C) 2024-2026: Deutsche Telekom
 //
 //   Licensed under the Apache License, Version 2.0 (the "License");
 //   you may not use this file except in compliance with the License.
@@ -21,19 +21,24 @@
 package utils
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/go-playground/validator/v10"
-	"github.com/google/uuid"
+	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"policy-opa-pdp/consts"
 	"policy-opa-pdp/pkg/log"
 	"policy-opa-pdp/pkg/model"
 	"policy-opa-pdp/pkg/model/oapicodegen"
 	"regexp"
+	"slices"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/go-playground/validator/v10"
+	"github.com/google/uuid"
 )
 
 type (
@@ -44,6 +49,7 @@ type (
 var (
 	CreateDirectoryVar       CreateDirectoryFunc       = CreateDirectory
 	removeAll                                          = os.RemoveAll
+	removeFile                                         = os.Remove
 	ValidateFieldsStructsVar ValidateFieldsStructsFunc = ValidateFieldsStructs
 )
 
@@ -179,6 +185,242 @@ func validateKeys(keys map[string]string, prefix, propertyType, emphasize string
 	return nil
 }
 
+func IsKeyOwnedByPolicy(key, policyName string) bool {
+	if key == "" || policyName == "" {
+		return false
+	}
+	if key == policyName {
+		return true
+	}
+	return strings.HasPrefix(key, policyName+".") && len(key) > len(policyName)+1
+}
+
+const DataKeyPrefix = "node."
+
+func HasSegmentPrefix(path, prefix []string) bool {
+	if len(prefix) > len(path) {
+		return false
+	}
+	for index := range prefix {
+		if path[index] != prefix[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func DataKeySegments(dataKey string) []string {
+	return strings.Split(dataKey, ".")
+}
+
+// FindKeyOwner returns the deployed policy a key belongs to
+func FindKeyOwner(key, keyPrefix string, policyNames []string) string {
+	owner := ""
+	for _, name := range policyNames {
+		if len(name) > len(owner) && IsKeyOwnedByPolicy(key, keyPrefix+name) {
+			owner = name
+		}
+	}
+	return owner
+}
+
+func ValidateKeyOwnership(policy model.ToscaPolicy, deployedNames []string) error {
+	names := append(append(make([]string, 0, len(deployedNames)+1), deployedNames...), policy.Name)
+	if err := checkKeysBelongToPolicy(policy.Properties.Policy, "", "policy", policy.Name, names); err != nil {
+		return err
+	}
+	return checkKeysBelongToPolicy(policy.Properties.Data, DataKeyPrefix, "data", policy.Name, names)
+}
+
+func checkKeysBelongToPolicy(keys map[string]string, keyPrefix, propertyType, policyName string, names []string) error {
+	for _, key := range slices.Sorted(maps.Keys(keys)) {
+		owner := FindKeyOwner(key, keyPrefix, names)
+		if owner != "" && owner != policyName {
+			return fmt.Errorf("%s key '%s' of policy '%s' belongs to deployed policy '%s'; a policy may only use keys under its own name", propertyType, key, policyName, owner)
+		}
+	}
+	return nil
+}
+
+// TopLevelItemNames returns the sorted names of the top-level items of a JSON object
+// It returns no items when the content is not a JSON object or has no items.
+func TopLevelItemNames(jsonContent string) []string {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(jsonContent), &object); err != nil {
+		return nil
+	}
+	return slices.Sorted(maps.Keys(object))
+}
+
+// ValidateDataItemsAvailable makes sure none of the top-level items of a data key sits
+// on, or above, the data of another deployed policy. Such an item would replace that
+// policy's data when it is written.
+func ValidateDataItemsAvailable(dataKey string, items []string, otherDataKeys map[string][]string) error {
+	keyPath := DataKeySegments(dataKey)
+	for _, item := range slices.Sorted(slices.Values(items)) {
+		itemPath := append(append(make([]string, 0, len(keyPath)+1), keyPath...), item)
+		if owner := findPolicyAtOrBelow(itemPath, otherDataKeys); owner != "" {
+			return fmt.Errorf("data item '%s' of data key '%s' would replace the data of deployed policy '%s'", item, dataKey, owner)
+		}
+	}
+	return nil
+}
+
+// findPolicyAtOrBelow returns a policy that has a data key at, or below, path ("" if none).
+func findPolicyAtOrBelow(path []string, dataKeysByPolicy map[string][]string) string {
+	for _, policyName := range slices.Sorted(maps.Keys(dataKeysByPolicy)) {
+		for _, dataKey := range dataKeysByPolicy[policyName] {
+			if HasSegmentPrefix(DataKeySegments(dataKey), path) {
+				return policyName
+			}
+		}
+	}
+	return ""
+}
+
+// ValidateDataKeyNotOccupied makes sure a data key is not already taken by a top-level
+// data item of another deployed policy. Writing it would replace that item.
+func ValidateDataKeyNotOccupied(dataKey string, occupiedItems map[string]map[string][]string) error {
+	policyName, occupiedPath := findOccupier(DataKeySegments(dataKey), occupiedItems)
+	if policyName != "" {
+		return fmt.Errorf("data key '%s' is already used by data item '%s' of deployed policy '%s'", dataKey, strings.Join(occupiedPath, "."), policyName)
+	}
+	return nil
+}
+
+func findOccupier(keyPath []string, occupiedItems map[string]map[string][]string) (string, []string) {
+	for _, policyName := range slices.Sorted(maps.Keys(occupiedItems)) {
+		if occupiedPath := findOccupiedPath(keyPath, occupiedItems[policyName]); occupiedPath != nil {
+			return policyName, occupiedPath
+		}
+	}
+	return "", nil
+}
+
+func findOccupiedPath(keyPath []string, itemsByDataKey map[string][]string) []string {
+	for _, deployedKey := range slices.Sorted(maps.Keys(itemsByDataKey)) {
+		for _, item := range itemsByDataKey[deployedKey] {
+			occupiedPath := append(DataKeySegments(deployedKey), item)
+			if HasSegmentPrefix(keyPath, occupiedPath) {
+				return occupiedPath
+			}
+		}
+	}
+	return nil
+}
+
+// OtherPolicyHoldingPath returns another policy whose data holds the path more closely than
+// the policy's own data does
+func OtherPolicyHoldingPath(path []string, ownDataKeys []string, otherDataKeys map[string][]string) string {
+	ownDepth := 0
+	for _, dataKey := range ownDataKeys {
+		segments := DataKeySegments(dataKey)
+		if HasSegmentPrefix(path, segments) {
+			ownDepth = max(ownDepth, len(segments))
+		}
+	}
+	for _, policyName := range slices.Sorted(maps.Keys(otherDataKeys)) {
+		for _, dataKey := range otherDataKeys[policyName] {
+			segments := DataKeySegments(dataKey)
+			if len(segments) > ownDepth && HasSegmentPrefix(path, segments) {
+				return policyName
+			}
+		}
+	}
+	return ""
+}
+
+// OtherPolicyUnderPath returns another policy that has data at, or below, the path
+func OtherPolicyUnderPath(path []string, otherDataKeys map[string][]string) string {
+	return findPolicyAtOrBelow(path, otherDataKeys)
+}
+
+// ChildPolicyNames returns the deployed policies nested under parentName, deepest first,
+// so that callers can process children before their parent.
+func ChildPolicyNames(parentName string, deployedNames []string) []string {
+	children := make([]string, 0)
+	for _, name := range deployedNames {
+		if name != parentName && IsKeyOwnedByPolicy(name, parentName) {
+			children = append(children, name)
+		}
+	}
+	sort.Strings(children)
+	sort.Stable(ByDotCount{Keys: children, Ascend: false})
+	return children
+}
+
+// TopmostPaths drops every path that lies inside another path of the list, and repeated
+// paths, so that only the outermost folders remain.
+func TopmostPaths(paths [][]string) [][]string {
+	topmost := make([][]string, 0, len(paths))
+	for index, path := range paths {
+		if !isCoveredByAnotherPath(index, path, paths) {
+			topmost = append(topmost, path)
+		}
+	}
+	return topmost
+}
+
+func isCoveredByAnotherPath(index int, path []string, paths [][]string) bool {
+	for otherIndex, other := range paths {
+		if otherIndex == index || !HasSegmentPrefix(path, other) {
+			continue
+		}
+		if len(other) < len(path) || otherIndex < index {
+			return true
+		}
+	}
+	return false
+}
+
+// RemoveFileAndEmptyParents removes one file and then every parent folder that became
+// empty, the files of other
+// policies are never touched.
+func RemoveFileAndEmptyParents(filePath, stopDir string) error {
+	if err := removeFile(filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("failed to remove file: %s, error: %w", filePath, err)
+	}
+	return removeEmptyParents(filepath.Dir(filePath), filepath.Clean(stopDir))
+}
+
+func removeEmptyParents(dir, stopDir string) error {
+	for current := filepath.Clean(dir); isStrictlyInside(current, stopDir); current = filepath.Dir(current) {
+		gone, err := removeDirIfEmpty(current)
+		if err != nil {
+			return err
+		}
+		if !gone {
+			return nil
+		}
+	}
+	return nil
+}
+
+func removeDirIfEmpty(dir string) (bool, error) {
+	isEmpty, err := isDirEmpty(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !isEmpty {
+		return false, nil
+	}
+	if err := removeFile(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("failed to remove directory: %s, error: %w", dir, err)
+	}
+	return true, nil
+}
+
+func isStrictlyInside(dir, root string) bool {
+	relative, err := filepath.Rel(root, dir)
+	if err != nil || relative == "." || relative == ".." {
+		return false
+	}
+	return !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
 func IsPolicyNameAllowed(policy model.ToscaPolicy, deployedPolicies []map[string]interface{}) (bool, error) {
 
 	policyID := policy.Name
@@ -198,12 +440,11 @@ func IsPolicyNameAllowed(policy model.ToscaPolicy, deployedPolicies []map[string
 		deployedPolicyIDHierarchyLevel := strings.Split(deployedPolicyID, ".")
 
 		if isParentOfExistingPolicy(policyHierarchyLevel, deployedPolicyIDHierarchyLevel) {
-			return false, fmt.Errorf("policy Validation Failed : Policy-id: %s is parent  of deployed policy, overrides existing policy: %s", policyID, deployedPolicyID)
+			log.Debugf("Policy-id: %s is the parent of deployed policy: %s, nested policies are allowed", policyID, deployedPolicyID)
 		}
 
 		if isChildOfExistingPolicy(policyHierarchyLevel, deployedPolicyIDHierarchyLevel) {
-			return false, fmt.Errorf("policy Validation Failed:  Policy-id: %s is child  of deployed policy , can overwrite existing policy: %s", policyID, deployedPolicyID)
-
+			log.Debugf("Policy-id: %s is a child of deployed policy: %s, nested policies are allowed", policyID, deployedPolicyID)
 		}
 
 	}
@@ -314,28 +555,6 @@ func IsValidString(name interface{}) bool {
 	default:
 		return false // Handles cases where name is neither a string nor a *string
 	}
-}
-
-func BuildBundle(cmdFunc func(string, ...string) *exec.Cmd) (string, error) {
-	cmd := cmdFunc(
-		consts.Opa,
-		consts.BuildBundle,
-		consts.V1Compatible,
-		consts.Policies,
-		consts.Data,
-		consts.Output,
-		consts.BundleTarGzFile,
-	)
-	log.Debugf("Before calling combinedoutput")
-	output, err := cmd.CombinedOutput()
-
-	if err != nil {
-		log.Warnf("Error output : %s", string(output))
-		log.Warnf("Failed to build Bundle: %v", err)
-		return string(output), err
-	}
-	log.Debug("Bundle Built Sucessfully....")
-	return string(output), nil
 }
 
 type CommonFields struct {

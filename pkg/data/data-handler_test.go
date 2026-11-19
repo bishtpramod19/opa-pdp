@@ -24,11 +24,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
-	openapi_types "github.com/oapi-codegen/runtime/types"
-	"github.com/open-policy-agent/opa/v1/storage"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"net/http"
 	"net/http/httptest"
 	"policy-opa-pdp/cfg"
@@ -38,6 +33,12 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	openapi_types "github.com/oapi-codegen/runtime/types"
+	"github.com/open-policy-agent/opa/v1/storage"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGetErrorResponseCodeForOPADataUpdate(t *testing.T) {
@@ -749,7 +750,7 @@ func TestPatchHandler_InvalidDataPath(t *testing.T) {
 		fmt.Println("error in currentDateTime")
 	}
 
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"policy-id": "valid-policy","policy-version": "v1"}]}`
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"policy-id": "valid-policy","policy-version": "v1"}]}`)
 
 	requestBody := &oapicodegen.OPADataUpdateRequest{
 		CurrentDate:     &currentDate,
@@ -856,7 +857,7 @@ func TestHandleDynamicUpdateRequestWithKafka_KafkaDisabled_Error(t *testing.T) {
 	req := httptest.NewRecorder()
 	patchInfos := []opasdk.PatchImpl{{}}
 
-	_ = handleDynamicUpdateRequestWithKafka(patchInfos, req)
+	_ = handleDynamicUpdateRequestWithKafka(context.Background(), patchInfos, req)
 	// Optionally assert on req.Body or req.Code if needed
 }
 
@@ -931,7 +932,7 @@ func TestHandleDynamicUpdateRequestWithKafka_KafkaDisabled_Success(t *testing.T)
 	req := httptest.NewRecorder()
 	patchInfos := []opasdk.PatchImpl{{}}
 
-	_ = handleDynamicUpdateRequestWithKafka(patchInfos, req)
+	_ = handleDynamicUpdateRequestWithKafka(context.Background(), patchInfos, req)
 
 	if patchCalled {
 		t.Errorf("Expected PatchData to be called")
@@ -972,7 +973,7 @@ func TestHandleDynamicUpdateRequestWithKafka_ProduceSuccess(t *testing.T) {
 	resp := httptest.NewRecorder()
 
 	// Act
-	err := handleDynamicUpdateRequestWithKafka(patches, resp)
+	err := handleDynamicUpdateRequestWithKafka(context.Background(), patches, resp)
 
 	// Assert
 	assert.NoError(t, err)
@@ -986,7 +987,7 @@ func TestHandleDynamicUpdateRequestWithKafka_ProducerNil(t *testing.T) {
 	PatchProducer = nil
 
 	// Act
-	err := handleDynamicUpdateRequestWithKafka(nil, httptest.NewRecorder())
+	err := handleDynamicUpdateRequestWithKafka(context.Background(), nil, httptest.NewRecorder())
 
 	// Assert
 	assert.EqualError(t, err, "failed to initialize Kafka producer")
@@ -999,7 +1000,7 @@ func TestHandleDynamicUpdateRequestWithKafka_ProduceError(t *testing.T) {
 	PatchProducer = mockProd
 
 	// Act
-	err := handleDynamicUpdateRequestWithKafka(nil, httptest.NewRecorder())
+	err := handleDynamicUpdateRequestWithKafka(context.Background(), nil, httptest.NewRecorder())
 
 	// Assert
 	assert.EqualError(t, err, "produce failed")
@@ -1225,9 +1226,9 @@ func TestExtractPatchInfo_NilOpType(t *testing.T) {
 }
 
 // validKafkaPatchRequest builds a PATCH request that passes all validation and
-// reaches the kafka branch. It sets up policymap.LastDeployedPolicies with a
-// policy whose data key matches the URL path. The caller must save/restore
-// cfg.UseKafkaForPatch and policymap.LastDeployedPolicies via t.Cleanup.
+// reaches the kafka branch. It sets up the deployed policies map with a policy
+// whose data key matches the URL path. The caller must save/restore
+// cfg.UseKafkaForPatch and the deployed policies map via t.Cleanup.
 func validKafkaPatchRequest(t *testing.T) *http.Request {
 	t.Helper()
 	ctime := "08:26:41.857Z"
@@ -1260,7 +1261,7 @@ func validKafkaPatchRequest(t *testing.T) *http.Request {
 		t.Fatalf("failed to marshal request body: %v", err)
 	}
 
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"policy-id": "kafka-test-policy", "policy-version": "v1.0", "data": ["kafka.test"]}]}`
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"policy-id": "kafka-test-policy", "policy-version": "v1.0", "data": ["kafka.test"]}]}`)
 
 	req, err := http.NewRequest("PATCH", "/policy/pdpo/v1/data/kafka/test", bytes.NewBuffer(bodyBytes))
 	if err != nil {
@@ -1273,11 +1274,11 @@ func TestPatchHandler_KafkaAccepted_BodyIsValidJSON(t *testing.T) {
 	// Arrange: save and restore globals
 	origKafka := cfg.UseKafkaForPatch
 	origProducer := PatchProducer
-	origPolicies := policymap.LastDeployedPolicies
+	origPolicies := policymap.GetLastDeployedPolicies()
 	t.Cleanup(func() {
 		cfg.UseKafkaForPatch = origKafka
 		PatchProducer = origProducer
-		policymap.LastDeployedPolicies = origPolicies
+		policymap.SetLastDeployedPolicies(origPolicies)
 	})
 
 	cfg.UseKafkaForPatch = true
@@ -1298,11 +1299,11 @@ func TestPatchHandler_KafkaSendFailure_ReturnsError(t *testing.T) {
 	// Arrange: nil PatchProducer triggers "failed to initialize Kafka producer" error
 	origKafka := cfg.UseKafkaForPatch
 	origProducer := PatchProducer
-	origPolicies := policymap.LastDeployedPolicies
+	origPolicies := policymap.GetLastDeployedPolicies()
 	t.Cleanup(func() {
 		cfg.UseKafkaForPatch = origKafka
 		PatchProducer = origProducer
-		policymap.LastDeployedPolicies = origPolicies
+		policymap.SetLastDeployedPolicies(origPolicies)
 	})
 
 	cfg.UseKafkaForPatch = true
@@ -1312,4 +1313,209 @@ func TestPatchHandler_KafkaSendFailure_ReturnsError(t *testing.T) {
 	patchHandler(rr, validKafkaPatchRequest(t))
 
 	assert.GreaterOrEqual(t, rr.Code, 400, "kafka send failure must not return 2xx")
+}
+
+// ---- Nested policies: a patch may only change the data of the policy it is for ----
+
+const nestedPatchState = `{"deployed_policies_dict": [` +
+	`{"policy-id": "onap.org.cell", "policy-version": "1.0", "data": ["node.onap.org.cell"]},` +
+	`{"policy-id": "onap.org.cell.consistency", "policy-version": "1.0", "data": ["node.onap.org.cell.consistency"]},` +
+	`{"policy-id": "onap.org.cellular", "policy-version": "1.0", "data": ["node.onap.org.cellular"]}` +
+	`]}`
+
+func useNestedPatchState(t *testing.T) {
+	orig := policymap.GetLastDeployedPolicies()
+	origGetPolicy := getPolicyByIDVar
+	t.Cleanup(func() {
+		policymap.SetLastDeployedPolicies(orig)
+		getPolicyByIDVar = origGetPolicy
+	})
+	getPolicyByIDVar = getPolicyByID
+	policymap.SetLastDeployedPolicies(nestedPatchState)
+}
+
+func nestedPatchRequest(t *testing.T, policyName, urlPath string, ops []map[string]interface{}) *http.Request {
+	t.Helper()
+	ctime, timeZone, timeOffset := "08:26:41.857Z", "America/New_York", "+02:00"
+	onapComp, onapIns, onapName := "COMPONENT", "INSTANCE", "ONAP"
+	parsedDate, _ := time.Parse("2006-01-02", "2024-02-12")
+	currentDate := openapi_types.Date{Time: parsedDate}
+	currentDateTime, _ := time.Parse(time.RFC3339, "2024-02-12T12:00:00Z")
+	requestBody := &oapicodegen.OPADataUpdateRequest{
+		CurrentDate: &currentDate, CurrentDateTime: &currentDateTime, CurrentTime: &ctime,
+		TimeOffset: &timeOffset, TimeZone: &timeZone, OnapComponent: &onapComp,
+		OnapInstance: &onapIns, OnapName: &onapName, PolicyName: policyName, Data: ops,
+	}
+	bodyBytes, err := json.Marshal(requestBody)
+	require.NoError(t, err)
+	req, err := http.NewRequest("PATCH", "/policy/pdpo/v1/data"+urlPath, bytes.NewBuffer(bodyBytes))
+	require.NoError(t, err)
+	return req
+}
+
+func TestValidatePolicyDataPathMatched_DotBoundary(t *testing.T) {
+	useNestedPatchState(t)
+
+	t.Run("Own data", func(t *testing.T) {
+		assert.True(t, validatePolicyDataPathMatched([]string{"", "node", "onap", "org", "cell"}, "onap.org.cell", httptest.NewRecorder()))
+		assert.True(t, validatePolicyDataPathMatched([]string{"", "node", "onap", "org", "cell", "threshold"}, "onap.org.cell", httptest.NewRecorder()))
+	})
+	t.Run("A look-alike name is not the policy's data", func(t *testing.T) {
+		res := httptest.NewRecorder()
+		assert.False(t, validatePolicyDataPathMatched([]string{"", "node", "onap", "org", "cellular"}, "onap.org.cell", res))
+		assert.Equal(t, http.StatusBadRequest, res.Code)
+		assert.Contains(t, res.Body.String(), "expected under url path")
+	})
+	t.Run("The parent cannot reach into the child's data", func(t *testing.T) {
+		res := httptest.NewRecorder()
+		assert.False(t, validatePolicyDataPathMatched([]string{"", "node", "onap", "org", "cell", "consistency"}, "onap.org.cell", res))
+		assert.Equal(t, http.StatusBadRequest, res.Code)
+		assert.Contains(t, res.Body.String(), "it is the data of policy 'onap.org.cell.consistency'")
+	})
+	t.Run("The child cannot reach into the parent's data", func(t *testing.T) {
+		res := httptest.NewRecorder()
+		assert.False(t, validatePolicyDataPathMatched([]string{"", "node", "onap", "org", "cell"}, "onap.org.cell.consistency", res))
+		assert.Equal(t, http.StatusBadRequest, res.Code)
+	})
+	t.Run("The child can change its own data", func(t *testing.T) {
+		assert.True(t, validatePolicyDataPathMatched([]string{"", "node", "onap", "org", "cell", "consistency", "limit"}, "onap.org.cell.consistency", httptest.NewRecorder()))
+	})
+}
+
+func patchAt(path ...string) opasdk.PatchImpl {
+	return opasdk.PatchImpl{Op: addOp, Path: storage.Path(path), Value: 1}
+}
+
+func TestValidatePatchOperationPaths(t *testing.T) {
+	useNestedPatchState(t)
+
+	tests := []struct {
+		name    string
+		policy  string
+		patch   opasdk.PatchImpl
+		wantErr string
+	}{
+		{"Parent changes its own item", "onap.org.cell", patchAt("node", "onap", "org", "cell", "threshold"), ""},
+		{"Parent edits the child's data", "onap.org.cell", patchAt("node", "onap", "org", "cell", "consistency", "limit"), "it is the data of policy 'onap.org.cell.consistency'"},
+		{"Parent removes the child's whole folder", "onap.org.cell", patchAt("node", "onap", "org", "cell", "consistency"), "it is the data of policy 'onap.org.cell.consistency'"},
+		{"Parent path outside its data", "onap.org.cell", patchAt("node", "onap", "org"), "is outside of it"},
+		{"Parent reaches a look-alike sibling", "onap.org.cell", patchAt("node", "onap", "org", "cellular", "x"), "is outside of it"},
+		{"Child changes its own data", "onap.org.cell.consistency", patchAt("node", "onap", "org", "cell", "consistency", "limit"), ""},
+		{"Child edits the parent's data", "onap.org.cell.consistency", patchAt("node", "onap", "org", "cell", "threshold"), "is outside of it"},
+		{"Sibling policy changes its own data", "onap.org.cellular", patchAt("node", "onap", "org", "cellular", "x"), ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := httptest.NewRecorder()
+
+			ok := validatePatchOperationPaths([]opasdk.PatchImpl{tt.patch}, tt.policy, res)
+
+			if tt.wantErr == "" {
+				assert.True(t, ok)
+				assert.Equal(t, 200, res.Code, "nothing is sent")
+				return
+			}
+			assert.False(t, ok)
+			assert.Equal(t, http.StatusBadRequest, res.Code)
+			assert.Contains(t, res.Body.String(), tt.wantErr)
+		})
+	}
+}
+
+func TestPatchPathProblem_PathAboveTheChildCoversIt(t *testing.T) {
+	others := map[string][]string{"onap.org.cell.consistency": {"node.onap.org.cell.consistency"}}
+
+	problem := patchPathProblem([]string{"node", "onap", "org", "cell"}, "onap.org.cell", []string{"node.onap.org.cell"}, others)
+
+	assert.Contains(t, problem, "it would replace or remove the data of policy 'onap.org.cell.consistency'")
+}
+
+func TestValidatePatchOperationPaths_OneBadOperationRefusesTheWholePatch(t *testing.T) {
+	useNestedPatchState(t)
+	res := httptest.NewRecorder()
+
+	ok := validatePatchOperationPaths([]opasdk.PatchImpl{
+		patchAt("node", "onap", "org", "cell", "threshold"),
+		patchAt("node", "onap", "org", "cell", "consistency", "limit"),
+	}, "onap.org.cell", res)
+
+	assert.False(t, ok)
+}
+
+func TestValidatePatchOperationPaths_PolicyLookupFailureAndUnreadableState(t *testing.T) {
+	useNestedPatchState(t)
+	getPolicyByIDVar = func(string, string) (*Policy, error) { return nil, fmt.Errorf("policy not found") }
+	res := httptest.NewRecorder()
+	assert.False(t, validatePatchOperationPaths([]opasdk.PatchImpl{patchAt("a")}, "x", res))
+	assert.Equal(t, http.StatusBadRequest, res.Code)
+
+	getPolicyByIDVar = func(string, string) (*Policy, error) { return &Policy{Data: []string{"a.b"}}, nil }
+	policymap.SetLastDeployedPolicies("{broken")
+	assert.True(t, validatePatchOperationPaths([]opasdk.PatchImpl{patchAt("a", "b", "c")}, "x", httptest.NewRecorder()),
+		"with unreadable deployed policies only the policy's own data is checked")
+}
+
+// The request as PAP-side users send it: a parent patch that reaches into the child is refused, nothing is applied.
+func TestPatchHandler_ParentPatchReachingIntoChildIsRefused(t *testing.T) {
+	useNestedPatchState(t)
+	origKafka, origPatch, origExists := cfg.UseKafkaForPatch, NewOpaSDKPatch, checkIfPolicyAlreadyExistsVar
+	t.Cleanup(func() {
+		cfg.UseKafkaForPatch, NewOpaSDKPatch, checkIfPolicyAlreadyExistsVar = origKafka, origPatch, origExists
+	})
+	cfg.UseKafkaForPatch = false
+	applied := 0
+	NewOpaSDKPatch = func(context.Context, []opasdk.PatchImpl) error { applied++; return nil }
+	checkIfPolicyAlreadyExistsVar = policymap.CheckIfPolicyAlreadyExists
+
+	ops := []map[string]interface{}{
+		{"op": "add", "path": "/threshold", "value": 7},
+		{"op": "remove", "path": "/consistency/limit"},
+	}
+	res := httptest.NewRecorder()
+	patchHandler(res, nestedPatchRequest(t, "onap.org.cell", "/node/onap/org/cell", ops))
+
+	assert.Equal(t, http.StatusBadRequest, res.Code)
+	assert.Contains(t, res.Body.String(), "it is the data of policy 'onap.org.cell.consistency'")
+	assert.Equal(t, 0, applied, "not even the harmless first operation is applied")
+}
+
+func TestPatchHandler_ParentPatchOfItsOwnDataIsApplied(t *testing.T) {
+	useNestedPatchState(t)
+	origKafka, origPatch, origExists := cfg.UseKafkaForPatch, NewOpaSDKPatch, checkIfPolicyAlreadyExistsVar
+	t.Cleanup(func() {
+		cfg.UseKafkaForPatch, NewOpaSDKPatch, checkIfPolicyAlreadyExistsVar = origKafka, origPatch, origExists
+	})
+	cfg.UseKafkaForPatch = false
+	var applied []opasdk.PatchImpl
+	NewOpaSDKPatch = func(_ context.Context, patches []opasdk.PatchImpl) error { applied = patches; return nil }
+	checkIfPolicyAlreadyExistsVar = policymap.CheckIfPolicyAlreadyExists
+
+	ops := []map[string]interface{}{{"op": "add", "path": "/threshold", "value": 7}}
+	res := httptest.NewRecorder()
+	patchHandler(res, nestedPatchRequest(t, "onap.org.cell", "/node/onap/org/cell", ops))
+
+	assert.Equal(t, http.StatusNoContent, res.Code)
+	require.Len(t, applied, 1)
+	assert.Equal(t, "/node/onap/org/cell/threshold", applied[0].Path.String())
+}
+
+func TestPatchHandler_ChildPatchOfItsOwnDataIsApplied(t *testing.T) {
+	useNestedPatchState(t)
+	origKafka, origPatch, origExists := cfg.UseKafkaForPatch, NewOpaSDKPatch, checkIfPolicyAlreadyExistsVar
+	t.Cleanup(func() {
+		cfg.UseKafkaForPatch, NewOpaSDKPatch, checkIfPolicyAlreadyExistsVar = origKafka, origPatch, origExists
+	})
+	cfg.UseKafkaForPatch = false
+	var applied []opasdk.PatchImpl
+	NewOpaSDKPatch = func(_ context.Context, patches []opasdk.PatchImpl) error { applied = patches; return nil }
+	checkIfPolicyAlreadyExistsVar = policymap.CheckIfPolicyAlreadyExists
+
+	ops := []map[string]interface{}{{"op": "replace", "path": "/limit", "value": 3}}
+	res := httptest.NewRecorder()
+	patchHandler(res, nestedPatchRequest(t, "onap.org.cell.consistency", "/node/onap/org/cell/consistency", ops))
+
+	assert.Equal(t, http.StatusNoContent, res.Code)
+	require.Len(t, applied, 1)
+	assert.Equal(t, "/node/onap/org/cell/consistency/limit", applied[0].Path.String())
 }

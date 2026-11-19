@@ -23,9 +23,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/google/uuid"
-	openapi_types "github.com/oapi-codegen/runtime/types"
-	"github.com/open-policy-agent/opa/storage"
 	"net/http"
 	"path/filepath"
 	"policy-opa-pdp/cfg"
@@ -38,7 +35,12 @@ import (
 	"policy-opa-pdp/pkg/opasdk"
 	"policy-opa-pdp/pkg/policymap"
 	"policy-opa-pdp/pkg/utils"
+	"slices"
 	"strings"
+
+	"github.com/google/uuid"
+	openapi_types "github.com/oapi-codegen/runtime/types"
+	"github.com/open-policy-agent/opa/storage"
 )
 
 type (
@@ -166,8 +168,12 @@ func patchHandler(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	if !validatePatchOperationPaths(patchInfos, policyId, res) {
+		return
+	}
+
 	if useKafkaForPatch {
-		if err := handleDynamicUpdateRequestWithKafka(patchInfos, res); err != nil {
+		if err := handleDynamicUpdateRequestWithKafka(req.Context(), patchInfos, res); err != nil {
 			log.Warnf("Error in handling dynamic update request with kafka: %v", err)
 			sendErrorResponse(res, err.Error(), http.StatusInternalServerError)
 			return
@@ -229,7 +235,7 @@ func getPatchInfo(data *[]map[string]interface{}, dataDir string, res http.Respo
 	return patchInfos, nil
 }
 
-func handleDynamicUpdateRequestWithKafka(patchInfos []opasdk.PatchImpl, res http.ResponseWriter) error {
+func handleDynamicUpdateRequestWithKafka(ctx context.Context, patchInfos []opasdk.PatchImpl, res http.ResponseWriter) error {
 
 	if PatchProducer == nil {
 		log.Warnf("Failed to initialize Kafka producer")
@@ -239,7 +245,7 @@ func handleDynamicUpdateRequestWithKafka(patchInfos []opasdk.PatchImpl, res http
 	sender := &publisher.RealPatchSender{
 		Producer: PatchProducer,
 	}
-	if err := sender.SendPatchMessage(patchInfos); err != nil {
+	if err := sender.SendPatchMessage(ctx, patchInfos); err != nil {
 		log.Warnf("Failed to send Patch Messge, %v", err)
 		return err
 	}
@@ -367,8 +373,7 @@ func validatePolicyDataPathMatched(dirParts []string, policyId string, res http.
 	if len(dirParts) > 0 && dirParts[0] == "" {
 		dirParts = dirParts[1:]
 	}
-	finalDirParts := strings.Join(dirParts, ".")
-	policiesMap := policymap.LastDeployedPolicies
+	policiesMap := policymap.GetLastDeployedPolicies()
 	matchedPolicy, err := getPolicyByIDVar(policiesMap, policyId)
 	if err != nil {
 		sendErrorResponse(res, err.Error(), http.StatusBadRequest)
@@ -378,21 +383,75 @@ func validatePolicyDataPathMatched(dirParts []string, policyId string, res http.
 
 	log.Infof("Matched policy: %+v", matchedPolicy)
 
-	// Check if finalDirParts starts with any data key
-	for _, dataKey := range matchedPolicy.Data {
-		if strings.HasPrefix(finalDirParts, dataKey) {
-			matchFound = true
-			break
-		}
-	}
-	if !matchFound {
+	// The url path must lie inside one of the policy's data keys
+	if !pathInsideAnyDataKey(dirParts, matchedPolicy.Data) {
 		errMsg := fmt.Sprintf("Dynamic Data add/replace/remove for policy '%s' expected under url path '%v'", policyId, matchedPolicy.Data)
 		sendErrorResponse(res, errMsg, http.StatusBadRequest)
 		log.Errorf("%s", errMsg)
 		return false
 	}
 
-	return matchFound
+	// ... and never inside the data of another policy, such as a nested child policy
+	if owner := utils.OtherPolicyHoldingPath(dirParts, matchedPolicy.Data, otherPoliciesDataKeys(policyId)); owner != "" {
+		errMsg := fmt.Sprintf("Dynamic Data add/replace/remove for policy '%s' is not allowed under url path '%s': it is the data of policy '%s'", policyId, strings.Join(dirParts, "/"), owner)
+		sendErrorResponse(res, errMsg, http.StatusBadRequest)
+		log.Errorf("%s", errMsg)
+		return false
+	}
+
+	return true
+}
+
+// pathInsideAnyDataKey reports whether the path lies at, or below, one of the data keys.
+func pathInsideAnyDataKey(path []string, dataKeys []string) bool {
+	return slices.ContainsFunc(dataKeys, func(dataKey string) bool {
+		return utils.HasSegmentPrefix(path, utils.DataKeySegments(dataKey))
+	})
+}
+
+// otherPoliciesDataKeys returns the data keys of the deployed policies other than the named one.
+func otherPoliciesDataKeys(policyId string) map[string][]string {
+	deployed, err := policymap.GetDeployedPolicyDetails()
+	if err != nil {
+		log.Warnf("Could not read the deployed policies to protect nested data: %v", err)
+		return nil
+	}
+	return policymap.DataKeysByPolicy(policymap.WithoutPolicy(deployed, policyId))
+}
+
+// validatePatchOperationPaths checks the final storage path of every operation, which is the
+// url path plus the path given in the request body: it must be inside the policy's own data,
+// not inside the data of another policy and must not cover the data of another policy.
+func validatePatchOperationPaths(patchInfos []opasdk.PatchImpl, policyId string, res http.ResponseWriter) bool {
+	matchedPolicy, err := getPolicyByIDVar(policymap.GetLastDeployedPolicies(), policyId)
+	if err != nil {
+		sendErrorResponse(res, err.Error(), http.StatusBadRequest)
+		log.Errorf("Error getting Policy By Id: %v", err.Error())
+		return false
+	}
+	others := otherPoliciesDataKeys(policyId)
+	for _, patchInfo := range patchInfos {
+		if errMsg := patchPathProblem(patchInfo.Path, policyId, matchedPolicy.Data, others); errMsg != "" {
+			sendErrorResponse(res, errMsg, http.StatusBadRequest)
+			log.Errorf("%s", errMsg)
+			return false
+		}
+	}
+	return true
+}
+
+// patchPathProblem returns why an operation path may not be changed by the policy
+func patchPathProblem(path []string, policyId string, ownDataKeys []string, others map[string][]string) string {
+	if !pathInsideAnyDataKey(path, ownDataKeys) {
+		return fmt.Sprintf("Dynamic Data add/replace/remove for policy '%s' expected under url path '%v', path '%s' is outside of it", policyId, ownDataKeys, storage.Path(path).String())
+	}
+	if owner := utils.OtherPolicyHoldingPath(path, ownDataKeys, others); owner != "" {
+		return fmt.Sprintf("Dynamic Data add/replace/remove for policy '%s' is not allowed on path '%s': it is the data of policy '%s'", policyId, storage.Path(path).String(), owner)
+	}
+	if owner := utils.OtherPolicyUnderPath(path, others); owner != "" {
+		return fmt.Sprintf("Dynamic Data add/replace/remove for policy '%s' is not allowed on path '%s': it would replace or remove the data of policy '%s'", policyId, storage.Path(path).String(), owner)
+	}
+	return ""
 }
 
 func constructOpStoragePath(op map[string]interface{}, root string, res http.ResponseWriter) storage.Path {

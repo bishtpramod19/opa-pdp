@@ -23,11 +23,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
-	"github.com/stretchr/testify/require"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"policy-opa-pdp/pkg/kafkacomm/publisher/mocks"
 	"policy-opa-pdp/pkg/model"
@@ -36,6 +32,10 @@ import (
 	"policy-opa-pdp/pkg/utils"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 func TestValidatePackageName(t *testing.T) {
@@ -254,7 +254,7 @@ func TestExtractAndDecodePolicies(t *testing.T) {
 }
 
 func TestValidateParentPolicy(t *testing.T) {
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"data": ["cell.consis"],"policy": ["cell.consis"],"policy-id": "cdll.consis","policy-version": "1.0.0"},{"data": ["parent"],"policy": ["parent"],"policy-id": "parent.policy","policy-version": "1.0.0"}]}` // Reset to valid case
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"data": ["cell.consis"],"policy": ["cell.consis"],"policy-id": "cdll.consis","policy-version": "1.0.0"},{"data": ["parent"],"policy": ["parent"],"policy-id": "parent.policy","policy-version": "1.0.0"}]}`) // Reset to valid case
 	tests := []struct {
 		name       string
 		input      model.ToscaPolicy
@@ -294,12 +294,12 @@ func TestValidateParentPolicy(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// If you want to test malformed policies, adjust policymap.LastDeployedPolicies accordingly
+			// If you want to test malformed policies, adjust the deployed policies map accordingly
 			switch tt.name {
 			case "Malformed last deployed policies":
-				policymap.LastDeployedPolicies = `{"deployed_policies_dict": [}`
+				policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [}`)
 			case "Policy id not present":
-				policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"data": ["parent"],"policy": ["parent"],"olicy-id": "parent.policy","policy-version": "1.0.0"}]}` // Reset to valid case
+				policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"data": ["parent"],"policy": ["parent"],"olicy-id": "parent.policy","policy-version": "1.0.0"}]}`) // Reset to valid case
 			}
 			actualPass, actualErr := validateParentPolicy(tt.input)
 			if tt.expectErr {
@@ -369,10 +369,10 @@ func TestVerifyPolicyByBundleCreation(t *testing.T) {
 	}
 
 	//Mocking the CreateBundle
-	createBundleFuncVar = func(execCmd func(string, ...string) *exec.Cmd, toscaPolicy model.ToscaPolicy) (string, error) {
-		return "", nil
+	createBundleFuncVar = func() error {
+		return nil
 	}
-	_, err := verifyPolicyByBundleCreation(policy)
+	err := verifyPolicyByBundleCreation(policy)
 	assert.NoError(t, err)
 
 }
@@ -387,7 +387,7 @@ func TestVerifyPolicyByBundleCreation_getDirEmpty(t *testing.T) {
 	}
 
 	//Mocking the CreateBundle
-	_, err := verifyPolicyByBundleCreation(policy)
+	err := verifyPolicyByBundleCreation(policy)
 	assert.NoError(t, err)
 
 }
@@ -402,10 +402,10 @@ func TestVerifyPolicyByBundleCreation_BundleFailure(t *testing.T) {
 	}
 
 	//Mocking the CreateBundle
-	createBundleFuncVar = func(execCmd func(string, ...string) *exec.Cmd, toscaPolicy model.ToscaPolicy) (string, error) {
-		return "", errors.New("Fail to Initialize Bundle")
+	createBundleFuncVar = func() error {
+		return errors.New("Fail to Initialize Bundle")
 	}
-	_, err := verifyPolicyByBundleCreation(policy)
+	err := verifyPolicyByBundleCreation(policy)
 	assert.Error(t, err)
 
 }
@@ -420,7 +420,7 @@ func TestCheckIfPolicyAlreadyDeployed_PolicymapEmpty(t *testing.T) {
 		},
 	}
 	// Test case 1: No deployed policies
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": []}` // Simulating an empty LastDeployedPolicies
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": []}`) // Simulating an empty LastDeployedPolicies
 	result := checkIfPolicyAlreadyDeployed(pdpUpdate)
 	assert.Equal(t, pdpUpdate.PoliciesToBeDeployed, result)
 }
@@ -435,7 +435,7 @@ func TestCheckIfPolicyAlreadyDeployed_ExistingPolicy(t *testing.T) {
 		},
 	}
 	// Test case 1: No deployed policies
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"data": ["cell.consis"],"policy": ["cell.consis"],"policy-id": "cdll.consis","policy-version": "1.0.0"},{"data": ["parent"],"policy": ["parent"],"policy-id": "TestPolicy1","policy-version": "1.0.0"}]}` // Reset to valid case
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"data": ["cell.consis"],"policy": ["cell.consis"],"policy-id": "cdll.consis","policy-version": "1.0.0"},{"data": ["parent"],"policy": ["parent"],"policy-id": "TestPolicy1","policy-version": "1.0.0"}]}`) // Reset to valid case
 	result := checkIfPolicyAlreadyDeployed(pdpUpdate)
 	assert.NotEqual(t, pdpUpdate.PoliciesToBeDeployed, result)
 }
@@ -573,12 +573,12 @@ func TestHandlePolicyDeployment_Success(t *testing.T) {
 		Name:                   "Test Pdp Update",
 	}
 	mockSender := new(mocks.PdpStatusSender)
-	mockSender.On("SendPdpStatus", mock.Anything).Return(nil)
+	mockSender.On("SendPdpStatus", mock.Anything, mock.Anything).Return(nil)
 	//Mocking fucntions
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{}]}` // Reset to valid case
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{}]}`) // Reset to valid case
 	createAndStorePolicyDataVar = func(policy model.ToscaPolicy) error { return nil }
-	createBundleFuncVar = func(execCmd func(string, ...string) *exec.Cmd, toscaPolicy model.ToscaPolicy) (string, error) {
-		return "", nil
+	createBundleFuncVar = func() error {
+		return nil
 	}
 	validateParentPolicyVar = func(policy model.ToscaPolicy) (bool, error) { return true, nil }
 	upsertPolicyFunc = func(model.ToscaPolicy) error { return nil }
@@ -612,9 +612,9 @@ func TestHandlePolicyDeployment_ValidateTosca(t *testing.T) {
 		PoliciesToBeUndeployed: []model.ToscaConceptIdentifier{},
 		Name:                   "Test Pdp Update",
 	}
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{}]}` // Reset to valid case
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{}]}`) // Reset to valid case
 	mockSender := new(mocks.PdpStatusSender)
-	mockSender.On("SendPdpStatus", mock.Anything).Return(nil)
+	mockSender.On("SendPdpStatus", mock.Anything, mock.Anything).Return(nil)
 
 	err, _ := handlePolicyDeployment(pdpUpdate, mockSender)
 	found := false
@@ -651,9 +651,9 @@ func TestHandlePolicyDeployment_ValidateParent(t *testing.T) {
 		PoliciesToBeUndeployed: []model.ToscaConceptIdentifier{},
 		Name:                   "Test Pdp Update",
 	}
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{"data": ["role.hello"],"policy": ["role.hello"],"policy-id": "role.hello","policy-version": "1.0.0"}]}` // Reset to valid case
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{"data": ["role.hello"],"policy": ["role.hello"],"policy-id": "role.hello","policy-version": "1.0.0"}]}`) // Reset to valid case
 	mockSender := new(mocks.PdpStatusSender)
-	mockSender.On("SendPdpStatus", mock.Anything).Return(nil)
+	mockSender.On("SendPdpStatus", mock.Anything, mock.Anything).Return(nil)
 	validateParentPolicyVar = func(policy model.ToscaPolicy) (bool, error) {
 		return false, errors.New("parent policy already present")
 	}
@@ -693,10 +693,10 @@ func TestHandlePolicyDeployment_StorePolicyDataFailure(t *testing.T) {
 		Name:                   "Test Pdp Update",
 	}
 	mockSender := new(mocks.PdpStatusSender)
-	mockSender.On("SendPdpStatus", mock.Anything).Return(nil)
+	mockSender.On("SendPdpStatus", mock.Anything, mock.Anything).Return(nil)
 
 	//Mocking fucntions
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{}]}` // Reset to valid case
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{}]}`) // Reset to valid case
 	createAndStorePolicyDataVar = func(policy model.ToscaPolicy) error { return errors.New("Failure in StorePolicyData") }
 	validateParentPolicyVar = func(policy model.ToscaPolicy) (bool, error) { return true, nil }
 	err, _ := handlePolicyDeployment(pdpUpdate, mockSender)
@@ -735,14 +735,14 @@ func TestHandlePolicyDeployment_VerifyBundleFailure(t *testing.T) {
 		Name:                   "Test Pdp Update",
 	}
 	mockSender := new(mocks.PdpStatusSender)
-	mockSender.On("SendPdpStatus", mock.Anything).Return(nil)
+	mockSender.On("SendPdpStatus", mock.Anything, mock.Anything).Return(nil)
 
 	//Mocking fucntions
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{}]}` // Reset to valid case
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{}]}`) // Reset to valid case
 	createAndStorePolicyDataVar = func(policy model.ToscaPolicy) error { return nil }
 	validateParentPolicyVar = func(policy model.ToscaPolicy) (bool, error) { return true, nil }
-	createBundleFuncVar = func(execCmd func(string, ...string) *exec.Cmd, toscaPolicy model.ToscaPolicy) (string, error) {
-		return "", errors.New("Failed to Bundle")
+	createBundleFuncVar = func() error {
+		return errors.New("Failed to Bundle")
 	}
 	err, _ := handlePolicyDeployment(pdpUpdate, mockSender)
 	found := false
@@ -781,14 +781,14 @@ func TestHandlePolicyDeployment_upsertPolicyAndDataFailure(t *testing.T) {
 		Name:                   "Test Pdp Update",
 	}
 	mockSender := new(mocks.PdpStatusSender)
-	mockSender.On("SendPdpStatus", mock.Anything).Return(nil)
+	mockSender.On("SendPdpStatus", mock.Anything, mock.Anything).Return(nil)
 
 	//Mocking fucntions
-	policymap.LastDeployedPolicies = `{"deployed_policies_dict": [{}]}` // Reset to valid case
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict": [{}]}`) // Reset to valid case
 	createAndStorePolicyDataVar = func(policy model.ToscaPolicy) error { return nil }
 	validateParentPolicyVar = func(policy model.ToscaPolicy) (bool, error) { return true, nil }
-	createBundleFuncVar = func(execCmd func(string, ...string) *exec.Cmd, toscaPolicy model.ToscaPolicy) (string, error) {
-		return "", nil
+	createBundleFuncVar = func() error {
+		return nil
 	}
 	upsertPolicyFunc = func(model.ToscaPolicy) error { return errors.New("SDKError") }
 	err, _ := handlePolicyDeployment(pdpUpdate, mockSender)
@@ -1042,4 +1042,577 @@ func TestUpsertData_Failure(t *testing.T) {
 	err := upsertData(policy)
 	// Test assertions
 	assert.Error(t, err)
+}
+
+// A decode failure must abort the upsert, not silently insert nothing and report
+// success.
+func TestUpsertPolicy_DecodeFailureIsPropagated(t *testing.T) {
+	origExtract := extractAndDecodePoliciesVar
+	origUpsert := opasdk.UpsertPolicyVar
+	t.Cleanup(func() {
+		extractAndDecodePoliciesVar = origExtract
+		opasdk.UpsertPolicyVar = origUpsert
+	})
+
+	extractAndDecodePoliciesVar = func(policy model.ToscaPolicy) (map[string]string, []string, error) {
+		return nil, nil, errors.New("illegal base64 data")
+	}
+	upsertCalled := false
+	opasdk.UpsertPolicyVar = func(ctx context.Context, policyID string, policyContent []byte) error {
+		upsertCalled = true
+		return nil
+	}
+
+	err := upsertPolicy(model.ToscaPolicy{Name: "TestPolicy", Version: "1.0.0"})
+
+	assert.Error(t, err, "A policy that cannot be decoded must not deploy successfully")
+	assert.False(t, upsertCalled, "Nothing may be written to the store when decoding failed")
+}
+
+func TestUpsertData_DecodeFailureIsPropagated(t *testing.T) {
+	origExtract := extractAndDecodeDataVar
+	origWrite := opasdk.WriteDataVar
+	t.Cleanup(func() {
+		extractAndDecodeDataVar = origExtract
+		opasdk.WriteDataVar = origWrite
+	})
+
+	extractAndDecodeDataVar = func(policy model.ToscaPolicy) (map[string]string, []string, error) {
+		return nil, nil, errors.New("illegal base64 data")
+	}
+	writeCalled := false
+	opasdk.WriteDataVar = func(ctx context.Context, dataPath string, data interface{}) error {
+		writeCalled = true
+		return nil
+	}
+
+	err := upsertData(model.ToscaPolicy{Name: "TestPolicy", Version: "1.0.0"})
+
+	assert.Error(t, err, "Data that cannot be decoded must not deploy successfully")
+	assert.False(t, writeCalled, "Nothing may be written to the store when decoding failed")
+}
+
+// A policy absent from the deployed-policies map cannot be decided on, so failing
+// to record it must be reported to PAP rather than logged and ignored.
+func TestDeployPolicyAndData_MapUpdateFailureIsReported(t *testing.T) {
+	origBundle := createBundleFuncVar
+	origUpsertPolicy := upsertPolicyFunc
+	origUpsertData := upsertDataFunc
+	origLastDeployed := policymap.GetLastDeployedPolicies()
+	t.Cleanup(func() {
+		createBundleFuncVar = origBundle
+		upsertPolicyFunc = origUpsertPolicy
+		upsertDataFunc = origUpsertData
+		policymap.SetLastDeployedPolicies(origLastDeployed)
+	})
+
+	createBundleFuncVar = func() error { return nil }
+	upsertPolicyFunc = func(policy model.ToscaPolicy) error { return nil }
+	upsertDataFunc = func(policy model.ToscaPolicy) error { return nil }
+	// Makes UpdateDeployedPoliciesinMap fail on unmarshal.
+	policymap.SetLastDeployedPolicies("not json")
+
+	successPolicies := make(map[string]string)
+	err := deployPolicyAndData(model.ToscaPolicy{Name: "TestPolicy", Version: "1.0.0"}, successPolicies)
+
+	assert.Error(t, err, "A policy that could not be recorded must not be reported as deployed")
+	assert.Empty(t, successPolicies, "The policy must not appear in the success list")
+}
+
+// ---- Nested policies: parent and child are deployed as separate policies ----
+
+func nestedTestPolicy(name, version, dataJSON string, extraPolicyKeys ...string) model.ToscaPolicy {
+	encode := func(text string) string { return base64.StdEncoding.EncodeToString([]byte(text)) }
+	policy := model.ToscaPolicy{
+		Name:     name,
+		Version:  version,
+		Metadata: model.Metadata{PolicyID: name, PolicyVersion: version},
+	}
+	policy.Properties.Policy = map[string]string{name: encode("package " + name + "\n")}
+	for _, key := range extraPolicyKeys {
+		policy.Properties.Policy[key] = encode("package " + key + "\n")
+	}
+	policy.Properties.Data = map[string]string{"node." + name: encode(dataJSON)}
+	return policy
+}
+
+// markDeployed records the policy in the deployed policies map the way a real deployment does.
+func markDeployed(t *testing.T, policy model.ToscaPolicy) {
+	_, err := policymap.UpdateDeployedPoliciesinMap(policy)
+	require.NoError(t, err)
+}
+
+// useRealDeployFunctions puts the real implementations behind the function hooks for one test,
+// because other tests replace them with mocks and leave them that way.
+func useRealDeployFunctions(t *testing.T) {
+	origExtractPolicies, origExtractData := extractAndDecodePoliciesVar, extractAndDecodeDataVar
+	origCreatePolicyDirs, origCreateDataDirs := createPolicyDirectoriesVar, createDataDirectoriesVar
+	origValidatePackage, origCreateDirectory := validatePackageNameVar, utils.CreateDirectoryVar
+	origValidateParent, origCreateAndStore := validateParentPolicyVar, createAndStorePolicyDataVar
+	t.Cleanup(func() {
+		extractAndDecodePoliciesVar, extractAndDecodeDataVar = origExtractPolicies, origExtractData
+		createPolicyDirectoriesVar, createDataDirectoriesVar = origCreatePolicyDirs, origCreateDataDirs
+		validatePackageNameVar, utils.CreateDirectoryVar = origValidatePackage, origCreateDirectory
+		validateParentPolicyVar, createAndStorePolicyDataVar = origValidateParent, origCreateAndStore
+	})
+	extractAndDecodePoliciesVar, extractAndDecodeDataVar = extractAndDecodePolicies, extractAndDecodeData
+	createPolicyDirectoriesVar, createDataDirectoriesVar = createPolicyDirectories, createDataDirectories
+	validatePackageNameVar, utils.CreateDirectoryVar = validatePackageName, utils.CreateDirectory
+	validateParentPolicyVar, createAndStorePolicyDataVar = validateParentPolicy, createAndStorePolicyData
+}
+
+func startWithNothingDeployed(t *testing.T) {
+	useRealDeployFunctions(t)
+	orig := policymap.GetLastDeployedPolicies()
+	t.Cleanup(func() { policymap.SetLastDeployedPolicies(orig) })
+	policymap.SetLastDeployedPolicies(`{"deployed_policies_dict":[]}`)
+}
+
+func TestValidateParentPolicy_ParentAfterChildIsAllowed(t *testing.T) {
+	startWithNothingDeployed(t)
+	markDeployed(t, nestedTestPolicy("onap.org.cell.consistency", "1.0", `{"limit":1}`))
+
+	allowed, err := validateParentPolicy(nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5}`))
+
+	assert.NoError(t, err)
+	assert.True(t, allowed)
+}
+
+func TestValidateParentPolicy_ChildAfterParentIsAllowed(t *testing.T) {
+	startWithNothingDeployed(t)
+	markDeployed(t, nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5}`))
+
+	allowed, err := validateParentPolicy(nestedTestPolicy("onap.org.cell.consistency", "1.0", `{"limit":1}`))
+
+	assert.NoError(t, err)
+	assert.True(t, allowed)
+}
+
+func TestValidateParentPolicy_ParentRedeployWhileChildIsDeployed(t *testing.T) {
+	startWithNothingDeployed(t)
+	markDeployed(t, nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5}`))
+	markDeployed(t, nestedTestPolicy("onap.org.cell.consistency", "1.0", `{"limit":1}`))
+
+	allowed, err := validateParentPolicy(nestedTestPolicy("onap.org.cell", "2.0", `{"threshold":9}`))
+
+	assert.NoError(t, err, "a new version of the parent is not blocked by its own earlier version or by the child")
+	assert.True(t, allowed)
+}
+
+func TestValidateParentPolicy_LookAlikeSiblingIsAllowed(t *testing.T) {
+	startWithNothingDeployed(t)
+	markDeployed(t, nestedTestPolicy("onap.org.cellular", "1.0", `{"x":1}`))
+
+	allowed, err := validateParentPolicy(nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5}`))
+
+	assert.NoError(t, err)
+	assert.True(t, allowed)
+}
+
+// A deployment may not use the keys of a policy that is already running.
+func TestValidateParentPolicy_KeyClashesAreRejected(t *testing.T) {
+	startWithNothingDeployed(t)
+	markDeployed(t, nestedTestPolicy("onap.org.cell.consistency", "1.0", `{"limit":1}`))
+	markDeployed(t, nestedTestPolicy("onap.org.cellular", "1.0", `{"x":1}`))
+
+	t.Run("Parent submits the child's policy key", func(t *testing.T) {
+		parent := nestedTestPolicy("onap.org.cell", "1.0", `{}`, "onap.org.cell.consistency")
+		allowed, err := validateParentPolicy(parent)
+		require.Error(t, err)
+		assert.False(t, allowed)
+		assert.Contains(t, err.Error(), "policy key 'onap.org.cell.consistency' of policy 'onap.org.cell' belongs to deployed policy 'onap.org.cell.consistency'")
+	})
+	t.Run("Policy submits a look-alike sibling's key", func(t *testing.T) {
+		policy := nestedTestPolicy("onap.org.cell", "1.0", `{}`, "onap.org.cellular")
+		_, err := validateParentPolicy(policy)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "belongs to deployed policy 'onap.org.cellular'")
+	})
+	t.Run("Parent submits the child's data key", func(t *testing.T) {
+		parent := nestedTestPolicy("onap.org.cell", "1.0", `{}`)
+		parent.Properties.Data["node.onap.org.cell.consistency"] = parent.Properties.Data["node.onap.org.cell"]
+		_, err := validateParentPolicy(parent)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "data key 'node.onap.org.cell.consistency' of policy 'onap.org.cell' belongs to deployed policy 'onap.org.cell.consistency'")
+	})
+}
+
+// Content inside the data: the parent's JSON must not carry an item that sits on the child's data.
+func TestValidateParentPolicy_ParentDataItemOnChildDataIsRejected(t *testing.T) {
+	startWithNothingDeployed(t)
+	markDeployed(t, nestedTestPolicy("onap.org.cell.consistency", "1.0", `{"limit":1}`))
+
+	allowed, err := validateParentPolicy(nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5,"consistency":{"limit":99}}`))
+
+	require.Error(t, err)
+	assert.False(t, allowed)
+	assert.Contains(t, err.Error(), "data item 'consistency' of data key 'node.onap.org.cell' would replace the data of deployed policy 'onap.org.cell.consistency'")
+}
+
+// The same clash the other way round: the parent is there first and already has the item.
+func TestValidateParentPolicy_ChildDataKeyOnParentItemIsRejected(t *testing.T) {
+	startWithNothingDeployed(t)
+	markDeployed(t, nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5,"consistency":{"x":1}}`))
+
+	allowed, err := validateParentPolicy(nestedTestPolicy("onap.org.cell.consistency", "1.0", `{"limit":1}`))
+
+	require.Error(t, err)
+	assert.False(t, allowed)
+	assert.Contains(t, err.Error(), "data key 'node.onap.org.cell.consistency' is already used by data item 'node.onap.org.cell.consistency' of deployed policy 'onap.org.cell'")
+}
+
+func TestValidatePolicyNesting_UnreadableDeployedPolicies(t *testing.T) {
+	useRealDeployFunctions(t)
+	orig := policymap.GetLastDeployedPolicies()
+	t.Cleanup(func() { policymap.SetLastDeployedPolicies(orig) })
+	policymap.SetLastDeployedPolicies("{broken")
+
+	assert.Error(t, validatePolicyNesting(nestedTestPolicy("onap.org.cell", "1.0", `{}`)))
+}
+
+func TestValidatePolicyNesting_NothingDeployed(t *testing.T) {
+	startWithNothingDeployed(t)
+
+	assert.NoError(t, validatePolicyNesting(nestedTestPolicy("onap.org.cell", "1.0", `{"consistency":1}`)))
+}
+
+// ---- Writing the data of a parent must not lose the data of its children ----
+
+type dataWrites struct {
+	plain []string
+	kept  []string
+	keep  [][][]string
+}
+
+func captureDataWrites(t *testing.T) *dataWrites {
+	origPlain, origKept := opasdk.WriteDataVar, opasdk.WriteDataKeepingFoldersVar
+	t.Cleanup(func() { opasdk.WriteDataVar, opasdk.WriteDataKeepingFoldersVar = origPlain, origKept })
+	writes := &dataWrites{}
+	opasdk.WriteDataVar = func(_ context.Context, path string, _ interface{}) error {
+		writes.plain = append(writes.plain, path)
+		return nil
+	}
+	opasdk.WriteDataKeepingFoldersVar = func(_ context.Context, path string, _ interface{}, keep [][]string) error {
+		writes.kept = append(writes.kept, path)
+		writes.keep = append(writes.keep, keep)
+		return nil
+	}
+	return writes
+}
+
+func TestUpsertData_ParentWrittenAfterChildKeepsChildFolder(t *testing.T) {
+	startWithNothingDeployed(t)
+	markDeployed(t, nestedTestPolicy("onap.org.cell.consistency", "1.0", `{"limit":1}`))
+	writes := captureDataWrites(t)
+
+	err := upsertData(nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5}`))
+
+	require.NoError(t, err)
+	assert.Empty(t, writes.plain, "a plain write would wipe the child")
+	assert.Equal(t, []string{"/node/onap/org/cell"}, writes.kept)
+	assert.Equal(t, [][][]string{{{"node", "onap", "org", "cell", "consistency"}}}, writes.keep)
+}
+
+func TestUpsertData_ParentWrittenBeforeChildIsWrittenAsBefore(t *testing.T) {
+	startWithNothingDeployed(t)
+	writes := captureDataWrites(t)
+
+	require.NoError(t, upsertData(nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5}`)))
+	markDeployed(t, nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5}`))
+	require.NoError(t, upsertData(nestedTestPolicy("onap.org.cell.consistency", "1.0", `{"limit":1}`)))
+
+	assert.Equal(t, []string{"/node/onap/org/cell", "/node/onap/org/cell/consistency"}, writes.plain)
+	assert.Empty(t, writes.kept, "nothing sits below either key, so nothing needs to be kept")
+}
+
+func TestUpsertData_OnlyOutermostChildFoldersAreKept(t *testing.T) {
+	startWithNothingDeployed(t)
+	markDeployed(t, nestedTestPolicy("onap.org.cell.consistency", "1.0", `{}`))
+	markDeployed(t, nestedTestPolicy("onap.org.cell.consistency.rules", "1.0", `{}`))
+	markDeployed(t, nestedTestPolicy("onap.org.cellular", "1.0", `{}`))
+	writes := captureDataWrites(t)
+
+	require.NoError(t, upsertData(nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5}`)))
+
+	assert.Equal(t, [][][]string{{{"node", "onap", "org", "cell", "consistency"}}}, writes.keep,
+		"the grandchild lives inside the child's folder and the look-alike is not below the parent")
+}
+
+func TestUpsertData_KeysOfOnePolicyKeepTheParentFirstOrder(t *testing.T) {
+	startWithNothingDeployed(t)
+	writes := captureDataWrites(t)
+	policy := nestedTestPolicy("onap.org.cell", "1.0", `{"a":1}`)
+	policy.Properties.Data["node.onap.org.cell.sub"] = policy.Properties.Data["node.onap.org.cell"]
+
+	require.NoError(t, upsertData(policy))
+
+	assert.Equal(t, []string{"/node/onap/org/cell", "/node/onap/org/cell/sub"}, writes.plain)
+}
+
+func TestUpsertData_UnreadableDeployedPoliciesFallBackToPlainWrite(t *testing.T) {
+	useRealDeployFunctions(t)
+	orig := policymap.GetLastDeployedPolicies()
+	t.Cleanup(func() { policymap.SetLastDeployedPolicies(orig) })
+	policymap.SetLastDeployedPolicies("{broken")
+	writes := captureDataWrites(t)
+
+	require.NoError(t, upsertData(nestedTestPolicy("onap.org.cell", "1.0", `{"a":1}`)))
+
+	assert.Equal(t, []string{"/node/onap/org/cell"}, writes.plain)
+}
+
+func TestUpsertData_KeepingWriteFailureIsReported(t *testing.T) {
+	startWithNothingDeployed(t)
+	markDeployed(t, nestedTestPolicy("onap.org.cell.consistency", "1.0", `{}`))
+	orig := opasdk.WriteDataKeepingFoldersVar
+	t.Cleanup(func() { opasdk.WriteDataKeepingFoldersVar = orig })
+	opasdk.WriteDataKeepingFoldersVar = func(context.Context, string, interface{}, [][]string) error {
+		return errors.New("store failure")
+	}
+
+	err := upsertData(nestedTestPolicy("onap.org.cell", "1.0", `{"a":1}`))
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "store failure")
+}
+
+// ---- Failed deployments must clean up only their own files ----
+
+func useTempBaseDirs(t *testing.T) (policyDir, dataDir string) {
+	useRealDeployFunctions(t)
+	origPolicyDir, origDataDir := basePolicyDir, baseDataDir
+	t.Cleanup(func() { basePolicyDir, baseDataDir = origPolicyDir, origDataDir })
+	root := t.TempDir()
+	basePolicyDir = filepath.Join(root, "policies")
+	baseDataDir = filepath.Join(root, "data")
+	return basePolicyDir, baseDataDir
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func writeNestedTestFiles(t *testing.T, policy model.ToscaPolicy) {
+	require.NoError(t, createAndStorePolicyData(policy))
+}
+
+func TestCleanupPolicyFiles_ParentLeavesChildFilesAlone(t *testing.T) {
+	policyDir, dataDir := useTempBaseDirs(t)
+	child := nestedTestPolicy("onap.org.cell.consistency", "1.0", `{"limit":1}`)
+	parent := nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5}`)
+	writeNestedTestFiles(t, child)
+	writeNestedTestFiles(t, parent)
+
+	cleanupPolicyFiles(parent)
+
+	assert.False(t, fileExists(filepath.Join(policyDir, "onap/org/cell/policy.rego")), "the parent's own file is removed")
+	assert.False(t, fileExists(filepath.Join(dataDir, "node/onap/org/cell/data.json")))
+	assert.True(t, fileExists(filepath.Join(policyDir, "onap/org/cell/consistency/policy.rego")), "the child's rules survive")
+	assert.True(t, fileExists(filepath.Join(dataDir, "node/onap/org/cell/consistency/data.json")), "the child's data survives")
+}
+
+func TestCleanupPolicyFiles_FirstDeploymentLeavesNothingBehind(t *testing.T) {
+	policyDir, dataDir := useTempBaseDirs(t)
+	policy := nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5}`)
+	writeNestedTestFiles(t, policy)
+
+	cleanupPolicyFiles(policy)
+
+	assert.False(t, fileExists(filepath.Join(policyDir, "onap")), "emptied folders are removed too")
+	assert.False(t, fileExists(filepath.Join(dataDir, "node/onap")))
+}
+
+// The bug from the requirement: a failed v2 deploy used to delete v1's files while v1 stays live.
+func TestCleanupPolicyFiles_FailedRedeployPutsPreviousVersionBack(t *testing.T) {
+	policyDir, dataDir := useTempBaseDirs(t)
+	v1 := nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5}`)
+	writeNestedTestFiles(t, v1)
+	v1Rego, err := os.ReadFile(filepath.Join(policyDir, "onap/org/cell/policy.rego"))
+	require.NoError(t, err)
+	v1Data, err := os.ReadFile(filepath.Join(dataDir, "node/onap/org/cell/data.json"))
+	require.NoError(t, err)
+	discardFileBackup("onap.org.cell")
+
+	v2 := nestedTestPolicy("onap.org.cell", "2.0", `{"threshold":9}`, "onap.org.cell.extra")
+	writeNestedTestFiles(t, v2)
+	require.True(t, fileExists(filepath.Join(policyDir, "onap/org/cell/extra/policy.rego")))
+
+	cleanupPolicyFiles(v2)
+
+	restoredRego, err := os.ReadFile(filepath.Join(policyDir, "onap/org/cell/policy.rego"))
+	require.NoError(t, err)
+	restoredData, err := os.ReadFile(filepath.Join(dataDir, "node/onap/org/cell/data.json"))
+	require.NoError(t, err)
+	assert.Equal(t, v1Rego, restoredRego, "v1's rules are back on disk")
+	assert.Equal(t, v1Data, restoredData, "v1's data is back on disk")
+	assert.False(t, fileExists(filepath.Join(policyDir, "onap/org/cell/extra/policy.rego")), "only what v2 added is removed")
+}
+
+func TestCleanupPolicyFiles_WithoutBackupRemovesOwnFiles(t *testing.T) {
+	policyDir, _ := useTempBaseDirs(t)
+	policy := nestedTestPolicy("onap.org.cell", "1.0", `{}`)
+	require.NoError(t, createPolicyDirectories(map[string]string{"onap.org.cell": "package onap.org.cell\n"}))
+	require.True(t, fileExists(filepath.Join(policyDir, "onap/org/cell/policy.rego")))
+
+	cleanupPolicyFiles(policy)
+
+	assert.False(t, fileExists(filepath.Join(policyDir, "onap/org/cell/policy.rego")))
+}
+
+func TestCleanupPolicyFiles_MissingFilesAreNotAnError(t *testing.T) {
+	useTempBaseDirs(t)
+
+	assert.NotPanics(t, func() { cleanupPolicyFiles(nestedTestPolicy("never.deployed", "1.0", `{}`)) })
+}
+
+func TestDiscardFileBackup(t *testing.T) {
+	useTempBaseDirs(t)
+	policy := nestedTestPolicy("onap.org.cell", "1.0", `{}`)
+	backupPolicyFiles(policy)
+
+	discardFileBackup("onap.org.cell")
+
+	assert.Nil(t, takeFileBackup("onap.org.cell"))
+}
+
+func TestVerifyPolicyByBundleCreation_FailureLeavesChildFilesAlone(t *testing.T) {
+	policyDir, dataDir := useTempBaseDirs(t)
+	child := nestedTestPolicy("onap.org.cell.consistency", "1.0", `{"limit":1}`)
+	parent := nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5}`)
+	writeNestedTestFiles(t, child)
+	writeNestedTestFiles(t, parent)
+	orig := createBundleFuncVar
+	t.Cleanup(func() { createBundleFuncVar = orig })
+	createBundleFuncVar = func() error { return errors.New("bundle failure") }
+
+	err := verifyPolicyByBundleCreation(parent)
+
+	require.Error(t, err)
+	assert.False(t, fileExists(filepath.Join(policyDir, "onap/org/cell/policy.rego")))
+	assert.True(t, fileExists(filepath.Join(policyDir, "onap/org/cell/consistency/policy.rego")))
+	assert.True(t, fileExists(filepath.Join(dataDir, "node/onap/org/cell/consistency/data.json")))
+}
+
+// ---- The live compile check and the full error message ----
+
+func stubDeployDependencies(t *testing.T) *[]string {
+	origBundle, origUpsertPolicy, origUpsertData := createBundleFuncVar, upsertPolicyFunc, upsertDataFunc
+	origCompile := opasdk.CompileWithLiveModulesVar
+	t.Cleanup(func() {
+		createBundleFuncVar, upsertPolicyFunc, upsertDataFunc = origBundle, origUpsertPolicy, origUpsertData
+		opasdk.CompileWithLiveModulesVar = origCompile
+	})
+	calls := []string{}
+	createBundleFuncVar = func() error { return nil }
+	upsertPolicyFunc = func(model.ToscaPolicy) error { calls = append(calls, "upsertPolicy"); return nil }
+	upsertDataFunc = func(model.ToscaPolicy) error { calls = append(calls, "upsertData"); return nil }
+	opasdk.CompileWithLiveModulesVar = func(context.Context, map[string]string) error { return nil }
+	return &calls
+}
+
+func TestDeployPolicyAndData_LiveCompileSeesTheCandidateModules(t *testing.T) {
+	useTempBaseDirs(t)
+	startWithNothingDeployed(t)
+	calls := stubDeployDependencies(t)
+	var seen map[string]string
+	opasdk.CompileWithLiveModulesVar = func(_ context.Context, candidates map[string]string) error {
+		seen = candidates
+		return nil
+	}
+	policy := nestedTestPolicy("onap.org.cell", "1.0", `{"a":1}`)
+
+	err := deployPolicyAndData(policy, map[string]string{})
+
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"onap.org.cell": "package onap.org.cell\n"}, seen, "keyed by module id, decoded")
+	assert.Equal(t, []string{"upsertPolicy", "upsertData"}, *calls)
+}
+
+func TestDeployPolicyAndData_LiveClashStopsBeforeAnythingIsStored(t *testing.T) {
+	policyDir, dataDir := useTempBaseDirs(t)
+	startWithNothingDeployed(t)
+	calls := stubDeployDependencies(t)
+	child := nestedTestPolicy("onap.org.cell.consistency", "1.0", `{"limit":1}`)
+	parent := nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5}`)
+	writeNestedTestFiles(t, child)
+	writeNestedTestFiles(t, parent)
+	longMessage := "2 error(s) occurred: " + strings.Repeat("rule data.onap.org.cell.consistency conflicts with rule ", 8) + "END-OF-MESSAGE"
+	opasdk.CompileWithLiveModulesVar = func(context.Context, map[string]string) error { return errors.New(longMessage) }
+
+	err := deployPolicyAndData(parent, map[string]string{})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to compile onap.org.cell together with the deployed policies")
+	assert.Contains(t, err.Error(), "END-OF-MESSAGE", "the full message is reported, not the first 200 characters")
+	assert.Greater(t, len(longMessage), 200)
+	assert.Empty(t, *calls, "neither the rules nor the data were stored")
+	assert.False(t, fileExists(filepath.Join(policyDir, "onap/org/cell/policy.rego")), "the parent's own files are cleaned up")
+	assert.True(t, fileExists(filepath.Join(policyDir, "onap/org/cell/consistency/policy.rego")), "the child's files are not")
+	assert.True(t, fileExists(filepath.Join(dataDir, "node/onap/org/cell/consistency/data.json")))
+}
+
+func TestDeployPolicyAndData_BundleFailureMessageIsNotCut(t *testing.T) {
+	useTempBaseDirs(t)
+	startWithNothingDeployed(t)
+	stubDeployDependencies(t)
+	longMessage := strings.Repeat("package clash ", 40) + "END-OF-MESSAGE"
+	createBundleFuncVar = func() error { return errors.New(longMessage) }
+
+	err := deployPolicyAndData(nestedTestPolicy("onap.org.cell", "1.0", `{}`), map[string]string{})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to build Rego File for onap.org.cell")
+	assert.Contains(t, err.Error(), "END-OF-MESSAGE")
+}
+
+func TestVerifyPolicyAgainstLiveModules_DecodeFailure(t *testing.T) {
+	useRealDeployFunctions(t)
+	policy := nestedTestPolicy("onap.org.cell", "1.0", `{}`)
+	policy.Properties.Policy["onap.org.cell"] = "not-base64!"
+
+	assert.Error(t, verifyPolicyAgainstLiveModules(policy))
+}
+
+func TestDeployPolicyAndData_ParentAfterChildFullFlow(t *testing.T) {
+	useTempBaseDirs(t)
+	startWithNothingDeployed(t)
+	writes := captureDataWrites(t)
+	stubDeployDependencies(t)
+	upsertDataFunc = upsertData
+	child := nestedTestPolicy("onap.org.cell.consistency", "1.0", `{"limit":1}`)
+	parent := nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5}`)
+	var failures []string
+	success := map[string]string{}
+
+	for _, policy := range []model.ToscaPolicy{child, parent} {
+		require.NoError(t, validateAndPreparePolicy(policy, &failures))
+		require.NoError(t, deployPolicyAndData(policy, success))
+	}
+
+	assert.Empty(t, failures)
+	assert.Equal(t, map[string]string{"onap.org.cell.consistency": "1.0", "onap.org.cell": "1.0"}, success)
+	assert.Equal(t, []string{"/node/onap/org/cell/consistency"}, writes.plain)
+	assert.Equal(t, []string{"/node/onap/org/cell"}, writes.kept, "the parent's write keeps the child's data")
+}
+
+func TestDeployPolicyAndData_ChildAfterParentFullFlow(t *testing.T) {
+	useTempBaseDirs(t)
+	startWithNothingDeployed(t)
+	writes := captureDataWrites(t)
+	stubDeployDependencies(t)
+	upsertDataFunc = upsertData
+	parent := nestedTestPolicy("onap.org.cell", "1.0", `{"threshold":5}`)
+	child := nestedTestPolicy("onap.org.cell.consistency", "1.0", `{"limit":1}`)
+	var failures []string
+	success := map[string]string{}
+
+	for _, policy := range []model.ToscaPolicy{parent, child} {
+		require.NoError(t, validateAndPreparePolicy(policy, &failures))
+		require.NoError(t, deployPolicyAndData(policy, success))
+	}
+
+	assert.Empty(t, failures)
+	assert.Equal(t, []string{"/node/onap/org/cell", "/node/onap/org/cell/consistency"}, writes.plain)
+	assert.Empty(t, writes.kept)
 }
